@@ -79,11 +79,13 @@ Add these redirect URIs to your OAuth app:
 
 ## Run
 
-```bash
-npm run dev
-```
+### Scripts
 
-Flow in the app:
+- `npm run dev` – start development server
+- `npm run build` – production build
+- `npm run preview` – preview production build locally
+
+#### Flow in the app
 1. Sign in.
 2. Enter a WebMap ID.
 3. Load map.
@@ -175,10 +177,3 @@ Notes:
 - **Create layer fails**: confirm account privileges for hosted feature layer creation.
 
 ---
-
-## Scripts
-
-- `npm run dev` – start development server
-- `npm run build` – production build
-- `npm run preview` – preview production build locally
-
