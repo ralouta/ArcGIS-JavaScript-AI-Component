@@ -1,0 +1,29 @@
+{
+  "name": "arcgis-ai-assistant-demo",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node node_modules/vite/bin/vite.js",
+    "build": "node node_modules/vite/bin/vite.js build",
+    "preview": "node node_modules/vite/bin/vite.js preview"
+  },
+  "dependencies": {
+    "@arcgis/ai-components": "^5.0.3",
+    "@arcgis/coding-components": "^5.0.3",
+    "@arcgis/core": "^5.0.3",
+    "@arcgis/map-components": "^5.0.3",
+    "@esri/calcite-components": "^5.0.2",
+    "@langchain/langgraph": "^1.1.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.27",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}

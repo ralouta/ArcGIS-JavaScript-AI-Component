@@ -1,0 +1,26 @@
+html,
+body,
+calcite-shell {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+}
+
+calcite-modal {
+  --calcite-modal-width: 500px;
+  --calcite-modal-max-width: 90vw;
+}
+
+calcite-modal::part(container) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#assistant-panel {
+  min-width: 360px;
+}
+
+arcgis-map {
+  display: block;
+}

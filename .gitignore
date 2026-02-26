@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+
+# Local env files
+.env.local
+.env.*.local
+
+# Demo/presenter assets (not for publish)
+demo-script-8-10min.md
+
+# OS / editor artifacts
+.DS_Store
+.vscode/
+*.log
