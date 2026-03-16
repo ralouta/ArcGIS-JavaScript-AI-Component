@@ -12,6 +12,18 @@ export interface ArcgisMcpContentMatch {
   type: string;
 }
 
+interface ArcgisMcpLayerSearchResponse {
+  keyword?: string;
+  count?: number;
+  matches?: ArcgisMcpLayerMatch[];
+}
+
+interface ArcgisMcpContentSearchResponse {
+  keyword?: string;
+  count?: number;
+  matches?: ArcgisMcpContentMatch[];
+}
+
 export interface ArcgisMcpFeatureTable {
   service_url: string;
   sample_size: number;
@@ -65,6 +77,21 @@ async function fetchJson<T>(url: string): Promise<T> {
   return (await response.json()) as T;
 }
 
+function normalizeArrayResponse<T>(payload: unknown, key: string): T[] {
+  if (Array.isArray(payload)) {
+    return payload as T[];
+  }
+
+  if (payload && typeof payload === "object") {
+    const value = (payload as Record<string, unknown>)[key];
+    if (Array.isArray(value)) {
+      return value as T[];
+    }
+  }
+
+  return [];
+}
+
 export function resolveArcgisMcpBaseUrl(): string {
   const configured = (import.meta.env.VITE_ARCGIS_MCP_BASE_URL as string | undefined)?.trim();
   return configured || "/api/arcgis-mcp";
@@ -78,9 +105,11 @@ export async function searchArcgisMcpLayers(
   keyword: string,
   baseUrl = resolveArcgisMcpBaseUrl()
 ): Promise<ArcgisMcpLayerMatch[]> {
-  return fetchJson<ArcgisMcpLayerMatch[]>(
+  const response = await fetchJson<ArcgisMcpLayerSearchResponse | ArcgisMcpLayerMatch[]>(
     buildUrl(baseUrl, "/api/search/layers", { keyword })
   );
+
+  return normalizeArrayResponse<ArcgisMcpLayerMatch>(response, "matches");
 }
 
 export async function searchArcgisMcpContent(
@@ -92,7 +121,12 @@ export async function searchArcgisMcpContent(
   if (itemType) {
     params.item_type = itemType;
   }
-  return fetchJson<ArcgisMcpContentMatch[]>(buildUrl(baseUrl, "/api/search/content", params));
+
+  const response = await fetchJson<ArcgisMcpContentSearchResponse | ArcgisMcpContentMatch[]>(
+    buildUrl(baseUrl, "/api/search/content", params)
+  );
+
+  return normalizeArrayResponse<ArcgisMcpContentMatch>(response, "matches");
 }
 
 export async function getArcgisMcpFeatureTable(
