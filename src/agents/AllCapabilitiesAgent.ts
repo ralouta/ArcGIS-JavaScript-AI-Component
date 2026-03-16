@@ -1,25 +1,93 @@
 import { StateGraph, Annotation as ANNOTATION, START, END } from "@langchain/langgraph/web";
 
-function buildCapabilitiesSummary(): string {
+type AgentSummary = {
+  name: string;
+  description: string;
+};
+
+const BUILT_IN_AGENT_SUMMARIES: Record<string, AgentSummary> = {
+  "arcgis-assistant-navigation-agent": {
+    name: "Navigation",
+    description: "Pan, zoom, and navigate to places on the active map.",
+  },
+  "arcgis-assistant-data-exploration-agent": {
+    name: "Data Exploration",
+    description: "Query map layers, inspect features, summarize map content, and answer data questions against the active web map.",
+  },
+};
+
+function prettifyTagName(tagName: string): string {
+  return tagName
+    .toLowerCase()
+    .replace(/^arcgis-assistant-/, "")
+    .replace(/-agent$/, "")
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function readCustomAgentSummary(agentElement: Element): AgentSummary | null {
+  const customAgent = agentElement as any;
+  const agent = customAgent.agent as { id?: string; name?: string; description?: string } | undefined;
+
+  if (!agent || agent.id === "all-capabilities-agent") {
+    return null;
+  }
+
+  return {
+    name: agent.name?.trim() || "Custom Agent",
+    description: agent.description?.trim() || "Custom assistant capability.",
+  };
+}
+
+function collectAssistantCapabilities(assistant: HTMLElement): AgentSummary[] {
+  const summaries: AgentSummary[] = [];
+  const seen = new Set<string>();
+
+  for (const child of Array.from(assistant.children)) {
+    const tagName = child.tagName.toLowerCase();
+
+    if (tagName === "arcgis-assistant-agent") {
+      const customSummary = readCustomAgentSummary(child);
+      if (!customSummary) continue;
+
+      const key = `${customSummary.name}|${customSummary.description}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      summaries.push(customSummary);
+      continue;
+    }
+
+    if (!tagName.startsWith("arcgis-assistant-") || tagName === "arcgis-assistant") {
+      continue;
+    }
+
+    const builtInSummary = BUILT_IN_AGENT_SUMMARIES[tagName] || {
+      name: prettifyTagName(tagName),
+      description: "Built-in assistant capability available in the current ArcGIS assistant instance.",
+    };
+
+    const key = `${builtInSummary.name}|${builtInSummary.description}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    summaries.push(builtInSummary);
+  }
+
+  return summaries;
+}
+
+function buildCapabilitiesSummary(assistant: HTMLElement): string {
+  const capabilities = collectAssistantCapabilities(assistant);
+
+  if (!capabilities.length) {
+    return "No assistant agents are currently registered.";
+  }
+
   return [
-    "Here is what I can do in this assistant:",
+    "Here are the assistant capabilities currently registered:",
     "",
-    "Built-in capabilities:",
-    "- Navigation agent: pan/zoom and navigate to places on the map.",
-    "- Data exploration agent: query layers, filter data, summarize map content, and answer data questions (embeddings-backed).",
-    "",
-    "Custom capability:",
-    "- Create hosted feature layers/services in your ArcGIS portal.",
-    "",
-    "Create-layer inputs I can parse:",
-    "- Layer/service name (for example: named Facilities)",
-    "- Geometry type: point, polyline, or polygon",
-    "- Optional fields (for example: Name:string, Capacity:int, OpenDate:date)",
-    "",
-    "Example prompts:",
-    "- Create a point feature layer named Facilities with fields: Name:string, Capacity:int.",
-    "- Create a polygon layer called Zoning with fields: Zone:string, MaxHeight:int.",
-    "- Create a polyline feature layer named Trails with fields: Name:string, Length:double.",
+    ...capabilities.map((capability) => `- ${capability.name}: ${capability.description}`),
   ].join("\n");
 }
 
@@ -40,7 +108,7 @@ export function registerFeatureLayerCapabilitiesAgent(assistant: HTMLElement) {
     });
 
     function summarizeNode() {
-      return { outputMessage: buildCapabilitiesSummary() };
+      return { outputMessage: buildCapabilitiesSummary(assistant) };
     }
 
     const graph = new StateGraph(state)

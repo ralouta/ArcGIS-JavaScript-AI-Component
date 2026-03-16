@@ -15,6 +15,7 @@ declare namespace JSX {
     "calcite-dropdown-item": any;
     // ArcGIS Map components
     "arcgis-map": any;
+    "arcgis-home": any;
     "arcgis-expand": any;
     "arcgis-legend": any;
     "arcgis-zoom": any;

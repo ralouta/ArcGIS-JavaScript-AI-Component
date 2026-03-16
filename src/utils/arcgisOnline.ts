@@ -102,6 +102,26 @@ interface LayerEmbeddingRecord {
   }>;
 }
 
+interface FlattenedOperationalLayer {
+  id?: string | number;
+  layerId?: string | number;
+  sublayerId?: string | number;
+  url?: string;
+  item?: {
+    url?: string;
+  };
+  layerType?: string;
+  title?: string;
+  description?: string;
+  layers?: FlattenedOperationalLayer[];
+  featureCollection?: {
+    layers?: FlattenedOperationalLayer[];
+  };
+  __serviceUrl?: string;
+  __itemUrl?: string;
+  [key: string]: any;
+}
+
 function buildUserItemUrl(
   portalUrl: string,
   owner: string,
@@ -150,31 +170,118 @@ function safeString(value: any): string {
   return typeof value === "string" ? value : "";
 }
 
-function resolveLayerUrl(operationalLayer: any): string | null {
-  const directUrl = safeString(operationalLayer?.url);
-  if (directUrl) return directUrl;
-
-  const itemUrl = safeString(operationalLayer?.item?.url);
-  if (!itemUrl) return null;
-
-  const layerId =
-    typeof operationalLayer?.layerId === "number"
-      ? operationalLayer.layerId
-      : typeof operationalLayer?.id === "number"
-      ? operationalLayer.id
-      : null;
-
-  if (layerId === null) return itemUrl;
-  return `${itemUrl.replace(/\/+$/, "")}/${layerId}`;
+function normalizeServiceUrl(value: any): string {
+  return safeString(value).trim().replace(/\?.*$/, "").replace(/\/+$/, "");
 }
 
-function shouldEmbedLayer(operationalLayer: any): boolean {
+function extractLayerId(operationalLayer: FlattenedOperationalLayer): number | null {
+  const candidates = [operationalLayer?.layerId, operationalLayer?.sublayerId, operationalLayer?.id];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return candidate;
+    }
+
+    if (typeof candidate === "string" && /^\d+$/.test(candidate.trim())) {
+      return Number(candidate);
+    }
+  }
+
+  return null;
+}
+
+function isConcreteServiceLayerUrl(url: string): boolean {
+  return /\/(?:FeatureServer|MapServer)\/\d+$/i.test(url);
+}
+
+function isServiceRootUrl(url: string): boolean {
+  return /\/(?:FeatureServer|MapServer)$/i.test(url);
+}
+
+function resolveConcreteServiceUrl(serviceUrl: string, layerId: number | null): string | null {
+  const normalizedUrl = normalizeServiceUrl(serviceUrl);
+  if (!normalizedUrl) return null;
+  if (isConcreteServiceLayerUrl(normalizedUrl)) return normalizedUrl;
+  if (layerId !== null && isServiceRootUrl(normalizedUrl)) {
+    return `${normalizedUrl}/${layerId}`;
+  }
+  return null;
+}
+
+function flattenOperationalLayers(
+  operationalLayers: FlattenedOperationalLayer[]
+): FlattenedOperationalLayer[] {
+  const flattened: FlattenedOperationalLayer[] = [];
+
+  const visit = (
+    layer: FlattenedOperationalLayer,
+    inheritedServiceUrl?: string,
+    inheritedItemUrl?: string
+  ) => {
+    const serviceUrl = normalizeServiceUrl(layer?.url) || inheritedServiceUrl || undefined;
+    const itemUrl = normalizeServiceUrl(layer?.item?.url) || inheritedItemUrl || undefined;
+
+    flattened.push({
+      ...layer,
+      __serviceUrl: serviceUrl,
+      __itemUrl: itemUrl,
+    });
+
+    const nestedLayers = [
+      ...(Array.isArray(layer?.layers) ? layer.layers : []),
+      ...(Array.isArray(layer?.featureCollection?.layers) ? layer.featureCollection.layers : []),
+    ];
+
+    for (const nestedLayer of nestedLayers) {
+      visit(nestedLayer, serviceUrl || itemUrl, itemUrl || serviceUrl);
+    }
+  };
+
+  for (const operationalLayer of operationalLayers) {
+    visit(operationalLayer);
+  }
+
+  return flattened;
+}
+
+function resolveLayerUrl(operationalLayer: FlattenedOperationalLayer): string | null {
+  const layerId = extractLayerId(operationalLayer);
+  const directUrl = resolveConcreteServiceUrl(
+    safeString(operationalLayer?.url) || safeString(operationalLayer?.__serviceUrl),
+    layerId
+  );
+  if (directUrl) return directUrl;
+
+  return resolveConcreteServiceUrl(
+    safeString(operationalLayer?.item?.url) || safeString(operationalLayer?.__itemUrl),
+    layerId
+  );
+}
+
+function shouldEmbedLayer(operationalLayer: FlattenedOperationalLayer): boolean {
   const layerType = safeString(operationalLayer?.layerType).toLowerCase();
-  const url = safeString(operationalLayer?.url).toLowerCase();
+  const url = normalizeServiceUrl(
+    operationalLayer?.url || operationalLayer?.__serviceUrl || operationalLayer?.item?.url || operationalLayer?.__itemUrl
+  ).toLowerCase();
+
+  if (
+    layerType.includes("group") ||
+    layerType.includes("tile") ||
+    layerType.includes("vector") ||
+    layerType.includes("scene") ||
+    layerType.includes("imagery")
+  ) {
+    return false;
+  }
+
   return (
+    isConcreteServiceLayerUrl(url) ||
+    isServiceRootUrl(url) ||
     layerType.includes("feature") ||
-    url.includes("/featureserver/") ||
-    url.includes("/mapserver/")
+    layerType.includes("map service") ||
+    layerType.includes("mapimage") ||
+    layerType.includes("map-image") ||
+    layerType.includes("subtype")
   );
 }
 
@@ -240,7 +347,9 @@ export async function generateAndSaveWebMapEmbeddings(params: {
   }
 
   const operationalLayers = Array.isArray(webMapData?.operationalLayers) ? webMapData.operationalLayers : [];
-  const candidateLayers = operationalLayers.filter(shouldEmbedLayer);
+  const flattenedLayers = flattenOperationalLayers(operationalLayers);
+  const candidateLayers = flattenedLayers.filter(shouldEmbedLayer);
+  const processedLayerUrls = new Set<string>();
 
   const layerRecords: LayerEmbeddingRecord[] = [];
   const embeddingInputs: string[] = [];
@@ -249,6 +358,8 @@ export async function generateAndSaveWebMapEmbeddings(params: {
   for (const operationalLayer of candidateLayers) {
     const layerUrl = resolveLayerUrl(operationalLayer);
     if (!layerUrl) continue;
+    if (processedLayerUrls.has(layerUrl)) continue;
+    processedLayerUrls.add(layerUrl);
 
     const layerInfoUrl = `${layerUrl}${layerUrl.includes("?") ? "&" : "?"}f=json&token=${encodeURIComponent(token)}`;
     const layerInfo = await fetchJson<any>(layerInfoUrl);
