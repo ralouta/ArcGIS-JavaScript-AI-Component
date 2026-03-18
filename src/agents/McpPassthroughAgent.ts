@@ -261,114 +261,124 @@ function makeSafeToolAlias(index: number): string {
   return `mcp_tool_${index + 1}`;
 }
 
-// ── Geo entity extraction ─────────────────────────────────────────────────────
+// ── Geo entity extraction (regex NER — no LLM call) ─────────────────────────
+//
+// Runs entirely outside the LangGraph execution cycle via a detached setTimeout
+// so the assistant finalises its state before any map work begins.
 
-/** Schema for the LLM geo-entity extraction tool. */
-const geoExtractionSchema = z.object({
-  countries: z
-    .array(z.string())
-    .describe(
-      "Exact country names mentioned in the text (e.g. 'Lebanon', 'Iran', 'Netherlands'). Empty array if none.",
-    ),
-  regions: z
-    .array(z.string())
-    .describe(
-      "World-region or sub-region names mentioned (e.g. 'Middle East', 'Western Europe'). Empty array if none.",
-    ),
-  points: z
-    .array(
-      z.object({
-        label: z.string().describe("Human-readable location name"),
-        lat: z.number().describe("Latitude in decimal degrees"),
-        lon: z.number().describe("Longitude in decimal degrees"),
-        description: z.string().optional().describe("One-sentence context"),
-      }),
-    )
-    .describe(
-      "Specific point locations that have known coordinates (e.g. a city whose coordinates appeared in the text). Empty array if none.",
-    ),
-});
+// World countries — matched case-insensitively against response text.
+const KNOWN_COUNTRIES = [
+  "Afghanistan","Albania","Algeria","Angola","Argentina","Armenia","Australia",
+  "Austria","Azerbaijan","Bahrain","Bangladesh","Belarus","Belgium","Bolivia",
+  "Bosnia","Brazil","Cambodia","Cameroon","Canada","Chile","China","Colombia",
+  "Congo","Croatia","Cuba","Cyprus","Czech Republic","Denmark","Ecuador",
+  "Egypt","Ethiopia","Finland","France","Georgia","Germany","Ghana","Greece",
+  "Guatemala","Haiti","Honduras","Hungary","India","Indonesia","Iran","Iraq",
+  "Ireland","Israel","Italy","Japan","Jordan","Kazakhstan","Kenya","Kuwait",
+  "Kyrgyzstan","Laos","Latvia","Lebanon","Libya","Lithuania","Malaysia",
+  "Mali","Mexico","Moldova","Mongolia","Morocco","Mozambique","Myanmar",
+  "Nepal","Netherlands","New Zealand","Nicaragua","Nigeria","North Korea",
+  "Norway","Oman","Pakistan","Palestine","Panama","Paraguay","Peru",
+  "Philippines","Poland","Portugal","Qatar","Romania","Russia","Rwanda",
+  "Saudi Arabia","Senegal","Serbia","Singapore","Somalia","South Africa",
+  "South Korea","South Sudan","Spain","Sri Lanka","Sudan","Sweden",
+  "Switzerland","Syria","Taiwan","Tajikistan","Tanzania","Thailand",
+  "Tunisia","Turkey","Turkmenistan","UAE","Uganda","Ukraine",
+  "United Arab Emirates","United Kingdom","United States","Uruguay",
+  "Uzbekistan","Venezuela","Vietnam","Yemen","Zimbabwe",
+];
 
-type GeoExtractionResult = z.infer<typeof geoExtractionSchema>;
+// Mappings from human-readable region label → WOR_Boundaries REGION field value.
+const REGION_TEXT_ALIASES: Record<string, string> = {
+  "middle east":        "Western Asia",
+  "western asia":       "Western Asia",
+  "east asia":          "Eastern Asia",
+  "southeast asia":     "Southeastern Asia",
+  "south asia":         "Southern Asia",
+  "central asia":       "Central Asia",
+  "east africa":        "Eastern Africa",
+  "west africa":        "Western Africa",
+  "north africa":       "Northern Africa",
+  "central africa":     "Middle Africa",
+  "southern africa":    "Southern Africa",
+  "sub-saharan africa": "Eastern Africa",
+  "europe":             "Western Europe",
+  "eastern europe":     "Eastern Europe",
+  "western europe":     "Western Europe",
+  "northern europe":    "Northern Europe",
+  "southern europe":    "Southern Europe",
+  "latin america":      "South America",
+  "south america":      "South America",
+  "central america":    "Central America",
+  "north america":      "Northern America",
+  "caribbean":          "Caribbean",
+  "gulf":               "Western Asia",
+  "gulf states":        "Western Asia",
+  "caucasus":           "Western Asia",
+  "balkans":            "Southern Europe",
+  "oceania":            "Australia/New Zealand",
+};
 
 /**
- * Ask the LLM to extract geographic entities from the final response text.
- * Uses a forced tool call so the output is always structured JSON.
+ * Extract geographic entities from response text + MCP tool call arguments
+ * using pure regex/lookup — zero extra LLM calls, safe to run off-graph.
  */
-async function extractGeoFromText(
+function extractGeoEntities(
   text: string,
   mcpToolArgs: Record<string, unknown>[],
-): Promise<GeoEntity[]> {
-  // Fast path: if there is literally no geographic language, skip the LLM call.
-  const geoSignals =
-    /\b(country|countries|region|city|cities|latitude|longitude|°[NS]|°[EW]|forecast|weather|beirut|tehran|amsterdam|paris|london|washington|beijing|cairo|israel|iran|lebanon|netherlands|europe|asia|africa|middle east|gulf)\b/i;
-  if (!geoSignals.test(text) && !mcpToolArgs.some((a) => "latitude" in a || "lat" in a)) {
-    return [];
-  }
-
+): GeoEntity[] {
   const entities: GeoEntity[] = [];
+  const lower = text.toLowerCase();
 
-  // 1. Pull coordinates directly out of the tool call arguments –
-  //    weather/geocode tools always have lat/lon, no LLM needed.
+  // 1. Coordinates from tool call arguments (weather, geocode, etc.).
   for (const args of mcpToolArgs) {
     const lat = Number(args.latitude ?? args.lat ?? NaN);
     const lon = Number(args.longitude ?? args.lon ?? args.long ?? NaN);
-    if (!isNaN(lat) && !isNaN(lon)) {
-      const label = String(args.location ?? args.city ?? args.name ?? `${lat.toFixed(4)}, ${lon.toFixed(4)}`);
-      // Avoid adding duplicates.
-      if (!entities.some((e) => e.kind === "point" && Math.abs((e as any).lat - lat) < 0.01)) {
+    if (!isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+      const label = String(
+        args.location ?? args.city ?? args.name ?? `${lat.toFixed(4)}, ${lon.toFixed(4)}`,
+      );
+      if (!entities.some((e) => e.kind === "point" && Math.abs((e as any).lat - lat) < 0.05)) {
         entities.push({ kind: "point", label, lat, lon });
       }
     }
   }
 
-  // 2. LLM extraction for country / region names.
-  try {
-    const extractionTool = tool(async (args: GeoExtractionResult) => JSON.stringify(args), {
-      name: "report_locations",
-      description:
-        "Report every geographic location mentioned in the provided text as structured data.",
-      schema: geoExtractionSchema,
-    });
+  // 2. Inline coordinates from text: «lat 33.89, lon 35.50» or «33.89°N 35.50°E».
+  const coordRe =
+    /(?:lat(?:itude)?[:\s]+(-?\d{1,3}\.\d+))[,\s]+(?:lon(?:gitude)?[:\s]+(-?\d{1,3}\.\d+))/gi;
+  let m: RegExpExecArray | null;
+  // eslint-disable-next-line no-cond-assign
+  while ((m = coordRe.exec(text)) !== null) {
+    const lat = parseFloat(m[1]);
+    const lon = parseFloat(m[2]);
+    if (!isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 &&
+        !entities.some((e) => e.kind === "point" && Math.abs((e as any).lat - lat) < 0.05)) {
+      entities.push({ kind: "point", label: `${lat.toFixed(2)}°, ${lon.toFixed(2)}°`, lat, lon });
+    }
+  }
 
-    const response = await invokeToolPrompt({
-      promptText:
-        "You are a geographic entity extractor. Read the text below and call report_locations ONCE with every country, world region, and coordinate-based point location you find. If there are no geographic entities, pass empty arrays.",
-      messages: [{ role: "user", content: text } as any],
-      tools: [extractionTool],
-      temperature: 0,
-    });
-
-    const toolCalls = (response as AIMessage).tool_calls ?? [];
-    for (const tc of toolCalls) {
-      if (tc.name !== "report_locations") continue;
-      const args = tc.args as GeoExtractionResult;
-
-      for (const name of args.countries ?? []) {
-        if (name.trim()) entities.push({ kind: "country", name: name.trim() });
-      }
-      for (const name of args.regions ?? []) {
-        if (name.trim()) entities.push({ kind: "region", name: name.trim() });
-      }
-      for (const pt of args.points ?? []) {
-        if (
-          pt.label &&
-          !isNaN(pt.lat) &&
-          !isNaN(pt.lon) &&
-          !entities.some((e) => e.kind === "point" && Math.abs((e as any).lat - pt.lat) < 0.01)
-        ) {
-          entities.push({
-            kind: "point",
-            label: pt.label,
-            lat: pt.lat,
-            lon: pt.lon,
-            description: pt.description,
-          });
-        }
+  // 3. Region names — longest-first to avoid partial matches.
+  const regionKeys = Object.keys(REGION_TEXT_ALIASES).sort((a, b) => b.length - a.length);
+  const addedRegions = new Set<string>();
+  for (const key of regionKeys) {
+    if (lower.includes(key)) {
+      const regionValue = REGION_TEXT_ALIASES[key];
+      if (!addedRegions.has(regionValue)) {
+        addedRegions.add(regionValue);
+        entities.push({ kind: "region", name: regionValue });
       }
     }
-  } catch {
-    // Geo extraction is best-effort; never block the primary response.
+  }
+
+  // 4. Country names — only when no overlapping region polygon was already added,
+  //    to avoid double-filing every country in a region.
+  for (const country of KNOWN_COUNTRIES) {
+    // Simple word-boundary-safe check: surrounded by non-letter chars.
+    const re = new RegExp(`(?<![a-z])${country.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-z])`, "i");
+    if (re.test(text)) {
+      entities.push({ kind: "country", name: country });
+    }
   }
 
   return entities;
@@ -537,42 +547,35 @@ export function registerMcpPassthroughAgent(
     function respondNode(agentState: any) {
       const messages = normalizeMessages(agentState?.messages);
       const lastAiMessage = getLastAiMessage(messages);
-      return {
-        outputMessage:
-          contentToText(lastAiMessage?.content) ||
-          `The ${ctx.serverName || "MCP"} server did not return a response.`,
-      };
-    }
+      const text =
+        contentToText(lastAiMessage?.content) ||
+        `The ${ctx.serverName || "MCP"} server did not return a response.`;
 
-    /**
-     * After the text response is committed, extract geographic entities from
-     * the final answer and tool-call arguments, then render them on the map.
-     * This node never modifies outputMessage — it is purely a rendering side-effect.
-     */
-    async function geoRenderNode(agentState: any) {
-      try {
-        const text: string = agentState?.outputMessage ?? "";
-        const toolArgs: Record<string, unknown>[] = agentState?.toolCallArgsList ?? [];
-        const entities = await extractGeoFromText(text, toolArgs);
-        if (entities.length) {
-          await renderMcpGeoEntities(entities);
+      // Fire geo rendering as a detached side-effect — completely outside the
+      // graph lifecycle so the assistant finishes cleanly before any map work.
+      const toolArgs: Record<string, unknown>[] = agentState?.toolCallArgsList ?? [];
+      setTimeout(() => {
+        try {
+          const entities = extractGeoEntities(text, toolArgs);
+          if (entities.length) {
+            void renderMcpGeoEntities(entities);
+          }
+        } catch {
+          // best-effort — never surface to user
         }
-      } catch {
-        // Geo rendering is best-effort; never surface errors to the user.
-      }
-      return {};
+      }, 0);
+
+      return { outputMessage: text };
     }
 
     return new StateGraph(state)
       .addNode("agent", agentNode)
       .addNode("tools", toolsNode)
       .addNode("respond", respondNode)
-      .addNode("geoRender", geoRenderNode)
       .addEdge(START, "agent")
       .addConditionalEdges("agent", routeAfterAgent, ["tools", "respond"])
       .addEdge("tools", "agent")
-      .addEdge("respond", "geoRender")
-      .addEdge("geoRender", END);
+      .addEdge("respond", END);
   };
 
   const serverLabel = ctx.serverName || "MCP Server";
