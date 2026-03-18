@@ -8,7 +8,9 @@ dist/
 .env.local
 .env.*.local
 
-# MCP hub local config — contains API keys and personal paths, never commit
+# MCP hub configs — contain API keys and personal paths, never commit
+# Copy mcp-hub.config.example.json → mcp-hub.config.json to get started
+mcp-hub.config.json
 mcp-hub.config.local.json
 
 # Demo/presenter assets (not for publish)

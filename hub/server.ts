@@ -73,8 +73,12 @@ interface ServerState {
 
 // Resolve config path:
 //   1. --config <path> CLI flag (explicit override)
-//   2. mcp-hub.config.local.json  (gitignored, holds real API keys/paths)
-//   3. mcp-hub.config.json        (public template — never contains secrets)
+//   2. mcp-hub.config.local.json  (gitignored, personal override)
+//   3. mcp-hub.config.json        (gitignored, copied from .example.json on first deploy)
+//
+// Neither .json file is committed. Clone the repo, then:
+//   cp mcp-hub.config.example.json mcp-hub.config.json
+//   # edit mcp-hub.config.json with your servers/keys
 function resolveConfigPath(): string {
   const flagIdx = process.argv.indexOf("--config");
   if (flagIdx !== -1 && process.argv[flagIdx + 1]) {
