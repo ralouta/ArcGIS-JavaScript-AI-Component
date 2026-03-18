@@ -71,11 +71,21 @@ interface ServerState {
 
 // ── Config persistence ────────────────────────────────────────────────────────
 
-const CONFIG_PATH = resolve(
-  process.argv.includes("--config") && process.argv[process.argv.indexOf("--config") + 1]
-    ? process.argv[process.argv.indexOf("--config") + 1]
-    : "mcp-hub.config.json",
-);
+// Resolve config path:
+//   1. --config <path> CLI flag (explicit override)
+//   2. mcp-hub.config.local.json  (gitignored, holds real API keys/paths)
+//   3. mcp-hub.config.json        (public template — never contains secrets)
+function resolveConfigPath(): string {
+  const flagIdx = process.argv.indexOf("--config");
+  if (flagIdx !== -1 && process.argv[flagIdx + 1]) {
+    return resolve(process.argv[flagIdx + 1]);
+  }
+  const localPath = resolve("mcp-hub.config.local.json");
+  if (existsSync(localPath)) return localPath;
+  return resolve("mcp-hub.config.json");
+}
+
+const CONFIG_PATH = resolveConfigPath();
 
 function loadConfig(): HubConfig {
   if (!existsSync(CONFIG_PATH)) {

@@ -8,6 +8,9 @@ dist/
 .env.local
 .env.*.local
 
+# MCP hub local config — contains API keys and personal paths, never commit
+mcp-hub.config.local.json
+
 # Demo/presenter assets (not for publish)
 demo-script-8-10min.md
 
