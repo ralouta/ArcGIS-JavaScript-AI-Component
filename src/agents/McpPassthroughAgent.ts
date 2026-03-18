@@ -3,7 +3,7 @@ import { AIMessage, ToolMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { StateGraph, Annotation as ANNOTATION, START, END } from "@langchain/langgraph/web";
 import { z } from "zod";
-import { renderMcpGeoEntities, type GeoEntity } from "../utils/mcpGeoRenderer";
+import { renderMcpGeoEntities, type GeoEntity, type GeoContext } from "../utils/mcpGeoRenderer";
 
 export interface McpPassthroughAgentContext {
   baseUrl?: string;
@@ -320,6 +320,59 @@ const REGION_TEXT_ALIASES: Record<string, string> = {
 };
 
 /**
+ * Extract per-entity context: find sentences in the response that mention
+ * the entity and collect any source URLs nearby. Zero LLM calls.
+ */
+function extractEntityContext(text: string, searchTerm: string): GeoContext | undefined {
+  const URL_RE = /https?:\/\/[^\s\])'"<>,\u0000-\u001f]+/g;
+  const esc = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nameRe = new RegExp(`(?<![a-zA-Z])${esc}(?![a-zA-Z])`, "i");
+
+  // split on blank lines or newlines; keeps article-style paragraphs intact
+  const paras = text.split(/\n+/).map((p) => p.trim()).filter(Boolean);
+  const relevant = paras.filter((p) => nameRe.test(p));
+
+  if (!relevant.length) return undefined;
+
+  // Collect URLs from relevant paragraphs
+  const urlSet = new Set<string>();
+  for (const para of relevant) {
+    URL_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = URL_RE.exec(para)) !== null) urlSet.add(m[0].replace(/[.,;:!?)]+$/, ""));
+  }
+
+  // Also scan a window around the first occurrence in full text
+  const nameIdx = text.search(nameRe);
+  if (nameIdx >= 0) {
+    const chunk = text.slice(Math.max(0, nameIdx - 60), nameIdx + 900);
+    URL_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = URL_RE.exec(chunk)) !== null) urlSet.add(m[0].replace(/[.,;:!?)]+$/, ""));
+  }
+
+  const summary = relevant
+    .slice(0, 3)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 420);
+
+  const links = [...urlSet]
+    .slice(0, 4)
+    .map((url) => {
+      try {
+        const label = new URL(url).hostname.replace(/^www\./, "");
+        return { url, label };
+      } catch {
+        return { url, label: url.slice(0, 40) };
+      }
+    });
+
+  return { summary, links };
+}
+
+/**
  * Extract geographic entities from response text + MCP tool call arguments
  * using pure regex/lookup — zero extra LLM calls, safe to run off-graph.
  */
@@ -339,7 +392,7 @@ function extractGeoEntities(
         args.location ?? args.city ?? args.name ?? `${lat.toFixed(4)}, ${lon.toFixed(4)}`,
       );
       if (!entities.some((e) => e.kind === "point" && Math.abs((e as any).lat - lat) < 0.05)) {
-        entities.push({ kind: "point", label, lat, lon });
+        entities.push({ kind: "point", label, lat, lon, context: extractEntityContext(text, label) });
       }
     }
   }
@@ -354,7 +407,8 @@ function extractGeoEntities(
     const lon = parseFloat(m[2]);
     if (!isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 &&
         !entities.some((e) => e.kind === "point" && Math.abs((e as any).lat - lat) < 0.05)) {
-      entities.push({ kind: "point", label: `${lat.toFixed(2)}°, ${lon.toFixed(2)}°`, lat, lon });
+      const coordLabel = `${lat.toFixed(2)}°, ${lon.toFixed(2)}°`;
+      entities.push({ kind: "point", label: coordLabel, lat, lon, context: extractEntityContext(text, coordLabel) });
     }
   }
 
@@ -366,7 +420,7 @@ function extractGeoEntities(
       const regionValue = REGION_TEXT_ALIASES[key];
       if (!addedRegions.has(regionValue)) {
         addedRegions.add(regionValue);
-        entities.push({ kind: "region", name: regionValue });
+        entities.push({ kind: "region", name: regionValue, context: extractEntityContext(text, key) });
       }
     }
   }
@@ -377,7 +431,7 @@ function extractGeoEntities(
     // Simple word-boundary-safe check: surrounded by non-letter chars.
     const re = new RegExp(`(?<![a-z])${country.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-z])`, "i");
     if (re.test(text)) {
-      entities.push({ kind: "country", name: country });
+      entities.push({ kind: "country", name: country, context: extractEntityContext(text, country) });
     }
   }
 

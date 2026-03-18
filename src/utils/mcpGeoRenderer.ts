@@ -96,24 +96,33 @@ function flagForIso3(iso3?: string): string {
 
 // ── Geo entity types ──────────────────────────────────────────────────────────
 
+/** Contextual reason why this entity appeared in the MCP response. */
+export interface GeoContext {
+  summary: string;                              // sentence(s) from the response
+  links: Array<{ url: string; label: string }>; // source URLs found near the mention
+}
+
 export interface GeoPoint {
   kind: "point";
   label: string;
   lat: number;
   lon: number;
   description?: string;
+  context?: GeoContext;
 }
 
 export interface GeoCountry {
   kind: "country";
   name: string;           // matches NAME field in Layer 1
   description?: string;
+  context?: GeoContext;
 }
 
 export interface GeoRegion {
   kind: "region";
   name: string;           // will be normalised to REGION field in Layer 0
   description?: string;
+  context?: GeoContext;
 }
 
 export type GeoEntity = GeoPoint | GeoCountry | GeoRegion;
@@ -169,78 +178,131 @@ const POINT_SYMBOL = {
   size: 13,
 };
 
-// ── Popup HTML builders ───────────────────────────────────────────────────────
+// ── Popup builders ────────────────────────────────────────────────────────────
 
-/** Format a large number with thousands separator */
-function fmtNum(n: number | null | undefined): string {
-  if (n == null || isNaN(Number(n))) return "—";
-  return Number(n).toLocaleString();
+/** Arcade expressions for smart number formatting in popups */
+export const POPUP_ARCADE_EXPRESSIONS = [
+  {
+    name: "pop",
+    title: "Population",
+    expression: `
+      var p = $feature.POP;
+      if (IsEmpty(p)) p = $feature.POP_EST;
+      if (IsEmpty(p)) return "—";
+      p = Number(p);
+      if (p >= 1e9)  return Text(p / 1e9,  "#.0") + "B";
+      if (p >= 1e6)  return Text(p / 1e6,  "#.0") + "M";
+      return Text(p, "#,###");
+    `,
+  },
+  {
+    name: "area",
+    title: "Area",
+    expression: `
+      var a = $feature.SQMI;
+      if (IsEmpty(a)) a = $feature.AREA_SQMI;
+      if (IsEmpty(a)) return "—";
+      return Text(Number(a), "#,###") + " sq mi";
+    `,
+  },
+  {
+    name: "gdp",
+    title: "GDP",
+    expression: `
+      var g = $feature.GDP_MD;
+      if (IsEmpty(g)) g = $feature.GDP;
+      if (IsEmpty(g)) return "—";
+      g = Number(g) * 1e6;
+      if (g >= 1e12) return "$" + Text(g / 1e12, "#.000") + "T";
+      if (g >= 1e9)  return "$" + Text(g / 1e9,  "#.0")   + "B";
+      return "$" + Text(g / 1e6, "#.0") + "M";
+    `,
+  },
+];
+
+/** Sanitise a string for safe HTML embedding */
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-/** Build a two-column stat row for the popup table */
-function row(label: string, value: string | number | null | undefined): string {
-  if (value == null || value === "" || value === 0) return "";
-  return `<tr><td style="color:#888;padding:2px 10px 2px 0;white-space:nowrap">${label}</td>
-          <td style="font-weight:500">${value}</td></tr>`;
+const CL = `style="color:#888;padding:2px 10px 2px 0;white-space:nowrap;font-size:0.82rem"`;
+const CV = `style="font-weight:500;font-size:0.88rem"`;
+
+/** Render the "Why this appeared" context block with summary + source links */
+function buildContextHtml(ctx?: GeoContext): string {
+  if (!ctx?.summary && !ctx?.links?.length) return "";
+  const summary = ctx.summary
+    ? `<p style="margin:0 0 6px;font-size:0.84rem;color:#444;line-height:1.5">${esc(ctx.summary)}</p>`
+    : "";
+  const links = ctx.links?.length
+    ? `<div style="font-size:0.8rem;display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:4px">` +
+      ctx.links.map(l => `<a href="${esc(l.url)}" target="_blank" rel="noopener noreferrer"
+          style="color:#0070c0;text-decoration:none">↗ ${esc(l.label)}</a>`).join("") +
+      `</div>`
+    : "";
+  return `
+    <details open style="margin-top:10px;border-top:1px solid #e4e4e4;padding-top:8px">
+      <summary style="cursor:pointer;font-size:0.8rem;color:#666;user-select:none;margin-bottom:6px">
+        💡 Why this appeared
+      </summary>
+      ${summary}${links}
+    </details>`;
 }
 
-function buildCountryPopup(attrs: Record<string, any>): string {
+function buildCountryPopupContent(attrs: Record<string, any>, ctx?: GeoContext): string {
   const flag    = flagForIso3(attrs.ISO_3DIGIT ?? attrs.ISO3 ?? attrs.ISO_CC);
-  const name    = attrs.NAME ?? attrs.COUNTRY ?? "";
-  const capital = attrs.CAPITAL ?? attrs.CAPNAME ?? "";
-  const pop     = attrs.POP ?? attrs.POP_EST ?? attrs.POPULATION;
-  const area    = attrs.SQMI ?? attrs.AREA_SQMI ?? attrs.AREASQM;
-  const region  = attrs.REGION ?? "";
-  const subReg  = attrs.SUBREGION ?? attrs.SUB_REGION ?? "";
-  const iso     = attrs.ISO_3DIGIT ?? attrs.ISO3 ?? "";
-  const gdp     = attrs.GDP_MD ?? attrs.GDP ?? null;
+  const capital = esc(attrs.CAPITAL ?? attrs.CAPNAME ?? "");
+  const subReg  = esc(attrs.SUBREGION ?? attrs.SUB_REGION ?? attrs.REGION ?? "");
+  const iso     = esc(attrs.ISO_3DIGIT ?? attrs.ISO3 ?? "");
 
   return `
     <div style="font-family:var(--calcite-sans-family,sans-serif);line-height:1.5">
-      <div style="font-size:2rem;margin-bottom:4px">${flag}</div>
-      <table style="border-collapse:collapse;font-size:0.88rem;min-width:180px">
-        ${row("Capital", capital)}
-        ${row("Population", fmtNum(pop))}
-        ${row("Area", area ? `${fmtNum(area)} sq mi` : null)}
-        ${row("Region", subReg || region)}
-        ${row("ISO code", iso)}
-        ${row("GDP (USD M)", gdp ? fmtNum(gdp) : null)}
+      <div style="font-size:2.2rem;margin-bottom:6px">${flag}</div>
+      <table style="border-collapse:collapse;min-width:190px">
+        ${capital  ? `<tr><td ${CL}>Capital</td><td ${CV}>${capital}</td></tr>` : ""}
+        <tr><td ${CL}>Population</td><td ${CV}>{expression/pop}</td></tr>
+        <tr><td ${CL}>Area</td><td ${CV}>{expression/area}</td></tr>
+        ${subReg   ? `<tr><td ${CL}>Region</td><td ${CV}>${subReg}</td></tr>` : ""}
+        ${iso      ? `<tr><td ${CL}>ISO</td><td ${CV}>${iso}</td></tr>` : ""}
+        <tr><td ${CL}>GDP</td><td ${CV}>{expression/gdp}</td></tr>
       </table>
+      ${buildContextHtml(ctx)}
     </div>`;
 }
 
-function buildRegionPopup(attrs: Record<string, any>): string {
-  const regionName  = attrs.REGION ?? "";
-  const subReg      = attrs.SUBREGION ?? attrs.CONTINENT ?? "";
-  const countryName = attrs.NAME ?? "";
-  const pop         = attrs.POP ?? attrs.POP_EST ?? attrs.POPULATION;
-  const area        = attrs.SQMI ?? attrs.AREA_SQMI ?? attrs.AREASQM;
+function buildRegionPopupContent(attrs: Record<string, any>, ctx?: GeoContext): string {
+  const countryName = esc(attrs.NAME ?? "");
+  const subReg      = esc(attrs.SUBREGION ?? attrs.CONTINENT ?? "");
+  const regionName  = esc(attrs.REGION ?? "");
 
   return `
     <div style="font-family:var(--calcite-sans-family,sans-serif);line-height:1.5">
-      <table style="border-collapse:collapse;font-size:0.88rem;min-width:180px">
-        ${row("Country", countryName)}
-        ${row("Sub-region", subReg)}
-        ${row("Region", regionName)}
-        ${row("Population", fmtNum(pop))}
-        ${row("Area", area ? `${fmtNum(area)} sq mi` : null)}
+      <table style="border-collapse:collapse;min-width:190px">
+        ${countryName ? `<tr><td ${CL}>Country</td><td ${CV}>${countryName}</td></tr>` : ""}
+        ${subReg      ? `<tr><td ${CL}>Sub-region</td><td ${CV}>${subReg}</td></tr>` : ""}
+        ${regionName  ? `<tr><td ${CL}>Region</td><td ${CV}>${regionName}</td></tr>` : ""}
+        <tr><td ${CL}>Population</td><td ${CV}>{expression/pop}</td></tr>
+        <tr><td ${CL}>Area</td><td ${CV}>{expression/area}</td></tr>
       </table>
+      ${buildContextHtml(ctx)}
     </div>`;
 }
 
-function buildPointPopup(pt: GeoPoint): string {
+function buildPointPopupContent(pt: GeoPoint): string {
+  const desc = pt.description ? `<p style="margin:6px 0 0;font-size:0.85rem;color:#444">${esc(pt.description)}</p>` : "";
   return `
     <div style="font-family:var(--calcite-sans-family,sans-serif);font-size:0.88rem;line-height:1.5">
       <table style="border-collapse:collapse;min-width:160px">
-        ${row("Lat / Lon", `${pt.lat.toFixed(4)}°, ${pt.lon.toFixed(4)}°`)}
-        ${pt.description ? `<tr><td colspan="2" style="padding-top:6px">${pt.description}</td></tr>` : ""}
+        <tr><td ${CL}>Lat / Lon</td><td ${CV}>${pt.lat.toFixed(4)}°, ${pt.lon.toFixed(4)}°</td></tr>
       </table>
+      ${desc}
+      ${buildContextHtml(pt.context)}
     </div>`;
 }
 
 // ── Graphic factories ─────────────────────────────────────────────────────────
 
-function countryFeatureToGraphic(feature: any): Graphic | null {
+function countryFeatureToGraphic(feature: any, entity?: GeoCountry): Graphic | null {
   if (!feature?.geometry) return null;
 
   let geometry: any;
@@ -263,12 +325,13 @@ function countryFeatureToGraphic(feature: any): Graphic | null {
     attributes: { ...attrs, _displayName: `${flag} ${name}`.trim() },
     popupTemplate: {
       title: `${flag} {NAME}`,
-      content: buildCountryPopup(attrs),
+      expressionInfos: POPUP_ARCADE_EXPRESSIONS,
+      content: buildCountryPopupContent(attrs, entity?.context),
     } as any,
   });
 }
 
-function regionFeatureToGraphic(feature: any): Graphic | null {
+function regionFeatureToGraphic(feature: any, entity?: GeoRegion): Graphic | null {
   if (!feature?.geometry) return null;
 
   let geometry: any;
@@ -291,7 +354,8 @@ function regionFeatureToGraphic(feature: any): Graphic | null {
     attributes: { ...attrs },
     popupTemplate: {
       title: name ? `${name} — ${region}` : region,
-      content: buildRegionPopup(attrs),
+      expressionInfos: POPUP_ARCADE_EXPRESSIONS,
+      content: buildRegionPopupContent(attrs, entity?.context),
     } as any,
   });
 }
@@ -333,7 +397,9 @@ export async function renderMcpGeoEntities(
       .join(",");
     const features = await queryLayer(LAYER_COUNTRY, `NAME IN (${list})`);
     for (const feat of features) {
-      const g = countryFeatureToGraphic(feat);
+      const name = (feat.attributes?.NAME ?? "").toLowerCase();
+      const entity = countries.find(c => c.name.toLowerCase() === name);
+      const g = countryFeatureToGraphic(feat, entity);
       if (g) layer.add(g);
     }
   }
@@ -349,7 +415,9 @@ export async function renderMcpGeoEntities(
       .join(",");
     const features = await queryLayer(LAYER_REGION, `REGION IN (${list})`);
     for (const feat of features) {
-      const g = regionFeatureToGraphic(feat);
+      const featureRegion = normaliseRegionName(feat.attributes?.REGION ?? "");
+      const entity = normalised.find(r => r.normalised === featureRegion);
+      const g = regionFeatureToGraphic(feat, entity);
       if (g) layer.add(g);
     }
   }
@@ -362,7 +430,7 @@ export async function renderMcpGeoEntities(
       attributes: { name: pt.label },
       popupTemplate: {
         title: `📍 {name}`,
-        content: buildPointPopup(pt),
+        content: buildPointPopupContent(pt),
       } as any,
     });
     layer.add(g);
