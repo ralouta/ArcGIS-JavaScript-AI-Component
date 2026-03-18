@@ -3,6 +3,7 @@ import { AIMessage, ToolMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { StateGraph, Annotation as ANNOTATION, START, END } from "@langchain/langgraph/web";
 import { z } from "zod";
+import { renderMcpGeoEntities, type GeoEntity } from "../utils/mcpGeoRenderer";
 
 export interface McpPassthroughAgentContext {
   baseUrl?: string;
@@ -260,6 +261,119 @@ function makeSafeToolAlias(index: number): string {
   return `mcp_tool_${index + 1}`;
 }
 
+// ── Geo entity extraction ─────────────────────────────────────────────────────
+
+/** Schema for the LLM geo-entity extraction tool. */
+const geoExtractionSchema = z.object({
+  countries: z
+    .array(z.string())
+    .describe(
+      "Exact country names mentioned in the text (e.g. 'Lebanon', 'Iran', 'Netherlands'). Empty array if none.",
+    ),
+  regions: z
+    .array(z.string())
+    .describe(
+      "World-region or sub-region names mentioned (e.g. 'Middle East', 'Western Europe'). Empty array if none.",
+    ),
+  points: z
+    .array(
+      z.object({
+        label: z.string().describe("Human-readable location name"),
+        lat: z.number().describe("Latitude in decimal degrees"),
+        lon: z.number().describe("Longitude in decimal degrees"),
+        description: z.string().optional().describe("One-sentence context"),
+      }),
+    )
+    .describe(
+      "Specific point locations that have known coordinates (e.g. a city whose coordinates appeared in the text). Empty array if none.",
+    ),
+});
+
+type GeoExtractionResult = z.infer<typeof geoExtractionSchema>;
+
+/**
+ * Ask the LLM to extract geographic entities from the final response text.
+ * Uses a forced tool call so the output is always structured JSON.
+ */
+async function extractGeoFromText(
+  text: string,
+  mcpToolArgs: Record<string, unknown>[],
+): Promise<GeoEntity[]> {
+  // Fast path: if there is literally no geographic language, skip the LLM call.
+  const geoSignals =
+    /\b(country|countries|region|city|cities|latitude|longitude|°[NS]|°[EW]|forecast|weather|beirut|tehran|amsterdam|paris|london|washington|beijing|cairo|israel|iran|lebanon|netherlands|europe|asia|africa|middle east|gulf)\b/i;
+  if (!geoSignals.test(text) && !mcpToolArgs.some((a) => "latitude" in a || "lat" in a)) {
+    return [];
+  }
+
+  const entities: GeoEntity[] = [];
+
+  // 1. Pull coordinates directly out of the tool call arguments –
+  //    weather/geocode tools always have lat/lon, no LLM needed.
+  for (const args of mcpToolArgs) {
+    const lat = Number(args.latitude ?? args.lat ?? NaN);
+    const lon = Number(args.longitude ?? args.lon ?? args.long ?? NaN);
+    if (!isNaN(lat) && !isNaN(lon)) {
+      const label = String(args.location ?? args.city ?? args.name ?? `${lat.toFixed(4)}, ${lon.toFixed(4)}`);
+      // Avoid adding duplicates.
+      if (!entities.some((e) => e.kind === "point" && Math.abs((e as any).lat - lat) < 0.01)) {
+        entities.push({ kind: "point", label, lat, lon });
+      }
+    }
+  }
+
+  // 2. LLM extraction for country / region names.
+  try {
+    const extractionTool = tool(async (args: GeoExtractionResult) => JSON.stringify(args), {
+      name: "report_locations",
+      description:
+        "Report every geographic location mentioned in the provided text as structured data.",
+      schema: geoExtractionSchema,
+    });
+
+    const response = await invokeToolPrompt({
+      promptText:
+        "You are a geographic entity extractor. Read the text below and call report_locations ONCE with every country, world region, and coordinate-based point location you find. If there are no geographic entities, pass empty arrays.",
+      messages: [{ role: "user", content: text } as any],
+      tools: [extractionTool],
+      temperature: 0,
+    });
+
+    const toolCalls = (response as AIMessage).tool_calls ?? [];
+    for (const tc of toolCalls) {
+      if (tc.name !== "report_locations") continue;
+      const args = tc.args as GeoExtractionResult;
+
+      for (const name of args.countries ?? []) {
+        if (name.trim()) entities.push({ kind: "country", name: name.trim() });
+      }
+      for (const name of args.regions ?? []) {
+        if (name.trim()) entities.push({ kind: "region", name: name.trim() });
+      }
+      for (const pt of args.points ?? []) {
+        if (
+          pt.label &&
+          !isNaN(pt.lat) &&
+          !isNaN(pt.lon) &&
+          !entities.some((e) => e.kind === "point" && Math.abs((e as any).lat - pt.lat) < 0.01)
+        ) {
+          entities.push({
+            kind: "point",
+            label: pt.label,
+            lat: pt.lat,
+            lon: pt.lon,
+            description: pt.description,
+          });
+        }
+      }
+    }
+  } catch {
+    // Geo extraction is best-effort; never block the primary response.
+  }
+
+  return entities;
+}
+
 // ── Agent Registration ────────────────────────────────────────────────────────
 
 export function registerMcpPassthroughAgent(
@@ -290,6 +404,15 @@ export function registerMcpPassthroughAgent(
           update: ToolAliasMap | undefined,
         ) => ({ ...current, ...(update ?? {}) }),
         default: () => ({}),
+      }),
+      // Accumulates raw tool-call argument objects across the whole run so the
+      // geo extraction node can pull out lat/lon without needing another LLM call.
+      toolCallArgsList: ANNOTATION({
+        reducer: (
+          current: Record<string, unknown>[] = [],
+          update: Record<string, unknown>[] | undefined,
+        ) => [...current, ...(update ?? [])],
+        default: () => [],
       }),
     });
 
@@ -361,14 +484,18 @@ export function registerMcpPassthroughAgent(
         const aliasMap = (agentState?.toolAliasMap ?? {}) as ToolAliasMap;
 
         const resolvedUrl = ctx.baseUrl || "";
+        const collectedArgs: Record<string, unknown>[] = [];
+
         const toolMessages = await Promise.all(
           lastAiMessage.tool_calls.map(async (toolCall: any) => {
             try {
               const originalToolName = aliasMap[toolCall.name] || toolCall.name;
+              const args = (toolCall.args as Record<string, unknown>) || {};
+              collectedArgs.push(args);
               const result = await callMcpTool(
                 resolvedUrl,
                 originalToolName,
-                (toolCall.args as Record<string, unknown>) || {}
+                args,
               );
               return new ToolMessage({ content: result, tool_call_id: toolCall.id ?? toolCall.name });
             } catch (error: any) {
@@ -381,7 +508,7 @@ export function registerMcpPassthroughAgent(
           })
         );
 
-        return { messages: toolMessages };
+        return { messages: toolMessages, toolCallArgsList: collectedArgs };
       } catch (err: any) {
         return {
           messages: [
@@ -417,14 +544,35 @@ export function registerMcpPassthroughAgent(
       };
     }
 
+    /**
+     * After the text response is committed, extract geographic entities from
+     * the final answer and tool-call arguments, then render them on the map.
+     * This node never modifies outputMessage — it is purely a rendering side-effect.
+     */
+    async function geoRenderNode(agentState: any) {
+      try {
+        const text: string = agentState?.outputMessage ?? "";
+        const toolArgs: Record<string, unknown>[] = agentState?.toolCallArgsList ?? [];
+        const entities = await extractGeoFromText(text, toolArgs);
+        if (entities.length) {
+          await renderMcpGeoEntities(entities);
+        }
+      } catch {
+        // Geo rendering is best-effort; never surface errors to the user.
+      }
+      return {};
+    }
+
     return new StateGraph(state)
       .addNode("agent", agentNode)
       .addNode("tools", toolsNode)
       .addNode("respond", respondNode)
+      .addNode("geoRender", geoRenderNode)
       .addEdge(START, "agent")
       .addConditionalEdges("agent", routeAfterAgent, ["tools", "respond"])
       .addEdge("tools", "agent")
-      .addEdge("respond", END);
+      .addEdge("respond", "geoRender")
+      .addEdge("geoRender", END);
   };
 
   const serverLabel = ctx.serverName || "MCP Server";
