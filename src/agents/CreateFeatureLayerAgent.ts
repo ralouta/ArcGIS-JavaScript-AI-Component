@@ -53,6 +53,10 @@ export function registerCreateFeatureLayerAgent(
         reducer: (_c: any, u: any) => (Array.isArray(u) ? u : null),
         default: () => null,
       }),
+      fieldsRequested: ANNOTATION({
+        reducer: (_c: any, u: any) => Boolean(u),
+        default: () => false,
+      }),
     });
 
     type ExtractedIntent = {
@@ -72,6 +76,10 @@ export function registerCreateFeatureLayerAgent(
 
     function esriFieldTypeFrom(textType: string): string {
       const t = textType.toLowerCase().trim();
+      if (t === "str" || t === "string" || t === "text") return "esriFieldTypeString";
+      if (t === "int" || t === "integer") return "esriFieldTypeInteger";
+      if (t === "float" || t === "double" || t === "number" || t === "decimal") return "esriFieldTypeDouble";
+      if (t === "date" || t === "datetime") return "esriFieldTypeDate";
       if (t.includes("string") || t.includes("text")) return "esriFieldTypeString";
       if (t.includes("int") || t.includes("integer")) return "esriFieldTypeInteger";
       if (t.includes("double") || t.includes("float") || t.includes("number") || t.includes("decimal")) {
@@ -83,15 +91,35 @@ export function registerCreateFeatureLayerAgent(
 
     function parseNameFallback(text: string): string | null {
       const t = text.trim();
+
+      // Prefer explicit title/name patterns first.
+      const explicitPatterns = [
+        /\btitle\s+["']([^"']+)["']/i,
+        /\bname\s+["']([^"']+)["']/i,
+        /\bcalled\s+["']([^"']+)["']/i,
+        /\bnamed\s+["']([^"']+)["']/i,
+      ];
+      for (const pattern of explicitPatterns) {
+        const m = t.match(pattern);
+        if (m && m[1] && m[1].trim()) return m[1].trim();
+      }
       
       // Simply look for 'named ' or 'called ' and extract the next quoted or non-quoted word
       let idx = t.toLowerCase().indexOf("named ");
       if (idx < 0) idx = t.toLowerCase().indexOf("called ");
+      if (idx < 0) idx = t.toLowerCase().indexOf("title ");
+      if (idx < 0) idx = t.toLowerCase().indexOf("name ");
       
       if (idx < 0) return null;
       
       // Get the text after 'named ' or 'called '
-      let remainder = t.substring(idx + (t.substring(idx).startsWith("named") ? 6 : 7)).trim();
+      const chunk = t.substring(idx).toLowerCase();
+      let skip = 7;
+      if (chunk.startsWith("named")) skip = 6;
+      else if (chunk.startsWith("called")) skip = 7;
+      else if (chunk.startsWith("title")) skip = 6;
+      else if (chunk.startsWith("name")) skip = 5;
+      let remainder = t.substring(idx + skip).trim();
       
       // Extract quoted string or first word
       let name = "";
@@ -128,33 +156,30 @@ export function registerCreateFeatureLayerAgent(
     function parseFieldsFallback(text: string): Array<{ name: string; type: string; alias?: string; length?: number }> | null {
       const t = text.trim();
       
-      // Find 'fields:' or 'with fields'
-      let fieldsIdx = t.toLowerCase().indexOf("fields:");
-      if (fieldsIdx < 0) {
-        fieldsIdx = t.toLowerCase().indexOf("with fields");
-        if (fieldsIdx >= 0) {
-          fieldsIdx += "with fields".length;
-        }
-      } else {
-        fieldsIdx += "fields:".length;
-      }
-      
-      if (fieldsIdx < 0) {
+      // Find any form of: "fields ...", "fields: ...", "with fields ..."
+      const match = t.match(/\bfields?\b\s*:?(.*)$/i);
+      if (!match) {
         return null;
       }
       
-      // Extract text after 'fields:' or 'with fields'
-      let fieldsText = t.substring(fieldsIdx).trim();
+      // Extract text after fields marker.
+      let fieldsText = (match[1] || "").trim();
+      if (!fieldsText) return null;
       
       // Remove trailing period, semicolon, or quote
       fieldsText = fieldsText.replace(/[.;"\s]+$/, "").trim();
       
-      // Split by comma and parse each field
-      const fieldParts = fieldsText.split(",").map(f => f.trim()).filter(f => f.length > 0);
+      // Accept both comma-separated and space-separated "field:type" patterns.
+      const rawTokens = fieldsText
+        .replace(/[;]+/g, ",")
+        .split(",")
+        .flatMap((segment) => segment.split(/\s+/))
+        .map((f) => f.trim())
+        .filter((f) => f.length > 0);
       
       const fields: Array<{ name: string; type: string; alias?: string; length?: number }> = [];
       
-      for (const part of fieldParts) {
+      for (const part of rawTokens) {
         // Look for 'Name:string' or 'Name (string)' format
         let colonIdx = part.indexOf(":");
         let parenIdx = part.indexOf("(");
@@ -178,6 +203,12 @@ export function registerCreateFeatureLayerAgent(
         if (!fieldName || !fieldType) {
           continue;
         }
+
+        // Skip obvious non-field words that can appear in prompts.
+        const stopWords = new Set(["fields", "and", "with", "title", "named", "called"]);
+        if (stopWords.has(fieldName.toLowerCase())) {
+          continue;
+        }
         
         // Clean up field type
         fieldType = fieldType.replace(/[).;\s]+$/, "").trim();
@@ -189,6 +220,10 @@ export function registerCreateFeatureLayerAgent(
       }
 
       return fields.length > 0 ? fields : null;
+    }
+
+    function hasFieldsIntent(text: string): boolean {
+      return /\bfields?\b/i.test(text);
     }
 
     function extractLastUserText(state: any): string {
@@ -271,11 +306,11 @@ export function registerCreateFeatureLayerAgent(
       const llmExtracted = typeof text === "string" && text ? await extractWithLLM(text) : null;
       
       const desired = llmExtracted?.name || (typeof text === "string" && text ? parseNameFallback(text) : null);
-      const chosen = desired || `FeatureService_${Date.now()}`;
       const geom = llmExtracted?.geometryType || (typeof text === "string" && text ? normalizeGeometryType(text) : null);
       const fields = llmExtracted?.fields || (typeof text === "string" && text ? parseFieldsFallback(text) : null);
+      const fieldsRequested = typeof text === "string" ? hasFieldsIntent(text) : false;
 
-      let msg = desired ? `Using requested name: ${chosen}` : `No name found; using default: ${chosen}`;
+      let msg = desired ? `Using requested name: ${desired}` : `No title/name detected in your prompt.`;
       if (geom) {
         msg += `\nGeometry type detected: ${geom.replace("esriGeometry", "")}`;
       } else if (!ctx.geometryType) {
@@ -283,19 +318,40 @@ export function registerCreateFeatureLayerAgent(
       }
       if (fields && fields.length) {
         msg += `\nParsed fields: ${fields.map((f) => `${f.name}:${(f.type || "").replace("esriFieldType", "")}`).join(", ")}`;
+      } else if (fieldsRequested) {
+        msg += `\nI detected a fields request but could not parse it. Use format like: fields why:str, date:date, year:int`;
       }
-      return { desiredName: chosen, desiredGeometryType: geom || null, desiredFields: fields || null, outputMessage: msg };
+      return {
+        desiredName: desired || null,
+        desiredGeometryType: geom || null,
+        desiredFields: fields || null,
+        fieldsRequested,
+        outputMessage: msg,
+      };
     }
 
     async function createLayerNode(s: any) {
-      const serviceName = s.desiredName || ctx.serviceName || `FeatureService_${Date.now()}`;
+      const serviceName = s.desiredName || ctx.serviceName || null;
       const layerName = ctx.layerName || "Layer0";
       const geometryType = s.desiredGeometryType || ctx.geometryType || null;
       const fields = s.desiredFields || ctx.fields || null;
+      const fieldsRequested = Boolean(s.fieldsRequested);
+      if (!serviceName) {
+        return {
+          outputMessage:
+            "Awaiting clarification: What title/name should I use for the feature layer? Example: title \"RamiFeatures\".",
+        };
+      }
       if (!geometryType) {
         return {
           outputMessage:
             "Awaiting clarification: What geometry type should I create? Reply with point, polyline, or polygon.",
+        };
+      }
+      if (fieldsRequested && (!fields || !fields.length)) {
+        return {
+          outputMessage:
+            "Awaiting clarification: I couldn't parse the fields list. Please provide fields like: fields why:str, date:date, year:int",
         };
       }
       try {

@@ -1,146 +1,133 @@
 # ArcGIS Assistant Demo
 
-Simple React + Vite demo built with ArcGIS Maps SDK and ArcGIS Assistant.
+React + Vite demo built with ArcGIS Maps SDK and ArcGIS Assistant.
 
-The app lets you:
-- sign in with ArcGIS
-- load a WebMap by item ID
-- ask questions about the map
-- create hosted feature layers from natural language
+**What it does:**
+- Sign in with ArcGIS, load a WebMap by item ID
+- Ask the assistant questions about the map (navigation, data exploration)
+- Create hosted feature layers from natural language
+- Connect external MCP servers and use their tools directly in the assistant
 
-## What You Need
+---
+
+## Requirements
 
 - Node.js 18+
-- an ArcGIS OAuth app/client ID
-- access to a WebMap
+- ArcGIS OAuth client ID
+- A WebMap item ID to load
 
-## ArcGIS OAuth Setup
+---
 
-Create an OAuth app in the same ArcGIS portal your users will sign in to.
+## Setup
 
-For ArcGIS Online:
-
-1. Sign in to ArcGIS Online.
-2. Create an app / developer credentials item.
-3. Copy the client ID.
-4. Add these redirect URLs:
-	- `http://localhost:5173`
-	- `http://localhost:4173`
-5. Save the app.
-6. Put that client ID into `VITE_ARCGIS_OAUTH_APP_ID` in `.env.local`.
-
-Use these redirect URLs:
-- `http://localhost:5173`
-- `http://localhost:4173`
-
-If you use ArcGIS Online, create the OAuth app there.
-If you use ArcGIS Enterprise, create it in that Enterprise portal.
-
-## Install
+### 1. Install
 
 ```bash
 npm install
 ```
 
-## Environment
+### 2. Environment
 
-Create a `.env.local` file in the project root:
-
-```bash
-VITE_ARCGIS_OAUTH_APP_ID=your-app-id
-VITE_ARCGIS_PORTAL_URL=https://www.arcgis.com
-VITE_APP_NAME=ArcGIS Assistant Demo
-```
-
-Notes:
-- `VITE_ARCGIS_OAUTH_APP_ID` is required
-- `VITE_ARCGIS_PORTAL_URL` is optional if you use ArcGIS Online
-- for ArcGIS Enterprise, set `VITE_ARCGIS_PORTAL_URL` to your portal URL
-
-Example:
+Create `.env.local` in the project root:
 
 ```bash
-VITE_ARCGIS_OAUTH_APP_ID=your-client-id-from-arcgis-online
+VITE_ARCGIS_OAUTH_APP_ID=your-client-id
+VITE_ARCGIS_PORTAL_URL=https://www.arcgis.com   # omit for ArcGIS Online default
+VITE_APP_NAME=ArcGIS Assistant Demo              # optional
 ```
 
-Example for Enterprise:
+### 3. ArcGIS OAuth App
 
-```bash
-VITE_ARCGIS_PORTAL_URL=https://your-portal.domain.com/portal
-```
+1. Sign in to your ArcGIS portal and create an OAuth app.
+2. Add redirect URLs: `http://localhost:5173` and `http://localhost:4173`.
+3. Copy the client ID into `VITE_ARCGIS_OAUTH_APP_ID`.
+
+---
 
 ## Run
 
-Start the app:
-
 ```bash
-npm run dev
+npm run dev       # start the app
+npm run hub       # start the MCP hub (required for MCP features)
+npm run hub:dev   # start the MCP hub in watch mode
+npm run build     # production build
+npm run preview   # preview the build
 ```
 
-Build for production:
+Run the app and hub in separate terminals.
 
-```bash
-npm run build
+---
+
+## Using the App
+
+1. Sign in with ArcGIS.
+2. Enter a WebMap item ID and click **Load map**.
+3. Ask the assistant anything about the map.
+
+**Demo WebMap ID:**
 ```
-
-Preview the build:
-
-```bash
-npm run preview
-```
-
-## How To Use
-
-1. Start the app.
-2. Sign in with ArcGIS.
-3. Enter a WebMap item ID.
-4. Click `Load map`.
-5. Ask the assistant questions about the map.
-
-## Demo WebMap
-
-You can test with this public WebMap ID:
-
-```text
 0cafaf0aa4174e5bac19113ab69bdc85
 ```
 
-## Example Prompts
-
+**Example prompts:**
 - `what layers are in this webmap?`
-- `summarize the visible layers`
 - `navigate me to baalbek`
-- `clear filters`
+- `create a point layer named Sites with fields: Name:string, Category:string`
+- `get the weather forecast for Beirut` *(requires a weather MCP server)*
+
+---
 
 ## Feature Layer Creation
 
-The app can also create hosted feature layers from natural language.
+Ask the assistant to create hosted feature layers:
 
-Examples:
-- `Create a point feature layer named Facilities with fields: Name:string, Capacity:int`
+- `Create a point layer named Facilities with fields: Name:string, Capacity:int`
 - `Create a polygon layer called Zoning with fields: Zone:string, MaxHeight:int`
-- `Create a polyline feature layer named Trails with fields: Name:string, Length:double`
+- `Create a polyline layer named Trails with fields: Name:string, Length:double`
+
+---
+
+## MCP Hub
+
+The app ships with a local MCP hub (`hub/server.ts`) that aggregates multiple MCP servers into a single endpoint the assistant can query.
+
+### Start the hub
+
+```bash
+npm run hub
+```
+
+### Add MCP servers
+
+Click the **MCP icon** (⚙) in the assistant panel header to open the server manager. From there you can:
+
+- **Add a server** — specify a command, arguments, and optional env vars. Any launch pattern works: `npx`, `node`, `python`, `uvx`, etc.
+- **Import from desktop config** — paste a JSON snippet in the standard `mcpServers` / `command` / `args` / `env` format.
+- **Start / stop / remove** servers at runtime.
+
+To bridge to a remote MCP server over stdio, use `npx mcp-remote` as the command:
+
+```
+Command:   npx
+Arguments: mcp-remote https://your-remote-mcp-server.com/mcp
+```
+
+The hub runs on port `8808` by default and is proxied through Vite at `/api/mcp` during development.
+
+---
 
 ## Embeddings
 
-The app automatically checks for WebMap embeddings and generates them when needed.
-If needed, you can manually regenerate embeddings from the assistant panel.
+The app auto-generates WebMap embeddings on first load. Weak answers usually mean stale embeddings — regenerate them to fix.
+
+---
 
 ## Troubleshooting
 
-- If sign-in does not work, verify `VITE_ARCGIS_OAUTH_APP_ID`
-- If the map does not load, verify the WebMap ID and sharing permissions
-- If answers are weak, regenerate embeddings
-- If hosted layer creation fails, verify your ArcGIS account has permission to create hosted feature layers
-
-## Optional MCP Setup
-
-MCP is optional.
-
-If you want to connect an MCP server, open the MCP configuration in the app and add your server URL.
-
-Use:
-- `/api/arcgis-mcp` if you want to use the built-in Vite proxy during local development
-- `http://localhost:8000` if you want to call your local MCP server directly and it supports CORS
-
-If direct localhost access gives `Failed to fetch`, use `/api/arcgis-mcp` instead.
+| Symptom | Fix |
+|---|---|
+| Sign-in fails | Check `VITE_ARCGIS_OAUTH_APP_ID` and redirect URLs |
+| Map won't load | Verify WebMap ID and its sharing permissions |
+| MCP tools unavailable | Confirm `npm run hub` is running and the server status shows green |
+| Feature layer creation fails | Verify your account has permission to create hosted feature layers |
+| Weak map answers | Regenerate WebMap embeddings |

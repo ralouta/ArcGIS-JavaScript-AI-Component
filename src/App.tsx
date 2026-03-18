@@ -2,10 +2,11 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import esriConfig from "@arcgis/core/config";
 import IdentityManager from "@arcgis/core/identity/IdentityManager";
 import mcpServerIcon from "../mcpicon.png";
-import { registerArcgisMcpPassthroughAgent } from "./agents/ArcgisMcpPassthroughAgent";
+import { registerMcpPassthroughAgent } from "./agents/McpPassthroughAgent";
 import { registerCreateFeatureLayerAgent } from "./agents/CreateFeatureLayerAgent";
 import { registerFeatureLayerCapabilitiesAgent } from "./agents/AllCapabilitiesAgent";
-import { getArcgisMcpHealth, resolveArcgisMcpBaseUrl } from "./utils/arcgisMcp";
+import { resolveArcgisMcpBaseUrl } from "./utils/arcgisMcp";
+import HubServerManager from "./components/HubServerManager";
 import {
   generateAndSaveWebMapEmbeddings,
   getCredential,
@@ -31,34 +32,6 @@ const webMapInputStyle: React.CSSProperties = {
   borderRadius: "4px",
   border: "1px solid #c7c7c7",
   fontSize: "1rem",
-};
-const dialogBodyStyle: React.CSSProperties = { padding: "0.75rem 0", display: "grid", gap: "0.85rem" };
-const mcpServerCardStyle: React.CSSProperties = {
-  border: "1px solid #d9d9d9",
-  borderRadius: "8px",
-  padding: "0.85rem",
-  display: "grid",
-  gap: "0.65rem",
-};
-const mcpServerHeaderStyle: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "space-between",
-  gap: "0.75rem",
-};
-const mcpServerRadioLabelStyle: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: "0.5rem",
-  fontWeight: 600,
-  color: "#3c3c3c",
-};
-const secondaryInputStyle: React.CSSProperties = {
-  width: "100%",
-  padding: "0.45rem 0.7rem",
-  borderRadius: "4px",
-  border: "1px solid #c7c7c7",
-  fontSize: "0.95rem",
 };
 const headerActionButtonScale = "l" as const;
 const headerActionsContainerStyle: React.CSSProperties = {
@@ -91,19 +64,7 @@ const mcpIconStyle: React.CSSProperties = {
   maskSize: "contain",
 };
 
-interface McpServerConfig {
-  id: string;
-  label: string;
-  url: string;
-}
 
-interface McpServerHealthState {
-  status: "checking" | "ok" | "error";
-  message: string;
-}
-
-const MCP_SERVER_STORAGE_KEY = "arcgis-assistant-mcp-servers";
-const ACTIVE_MCP_SERVER_STORAGE_KEY = "arcgis-assistant-active-mcp-server";
 const ASSISTANT_USER_BUBBLE_STYLE_ID = "assistant-user-bubble-wrap-style";
 const ASSISTANT_USER_BUBBLE_CSS = `
 .assistant-chat-card__prompt-container {
@@ -122,79 +83,7 @@ const ASSISTANT_USER_BUBBLE_CSS = `
 }
 `;
 
-function createMcpServerId(): string {
-  return `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
 
-function createMcpServerConfig(url: string, label: string): McpServerConfig {
-  return {
-    id: createMcpServerId(),
-    label,
-    url,
-  };
-}
-
-function getDefaultMcpServerConfig(defaultUrl: string): McpServerConfig {
-  return {
-    id: "default-mcp-server",
-    label: "Default MCP server",
-    url: defaultUrl,
-  };
-}
-
-function sanitizeMcpServers(servers: McpServerConfig[], defaultUrl: string): McpServerConfig[] {
-  const sanitized = servers
-    .map((server) => ({
-      ...server,
-      label: server.label.trim(),
-      url: server.url.trim(),
-    }))
-    .filter((server) => server.url);
-
-  return sanitized.length ? sanitized : [getDefaultMcpServerConfig(defaultUrl)];
-}
-
-function loadMcpServerConfig(defaultUrl: string): {
-  servers: McpServerConfig[];
-  activeServerId: string;
-} {
-  if (typeof window === "undefined") {
-    const fallback = getDefaultMcpServerConfig(defaultUrl);
-    return { servers: [fallback], activeServerId: fallback.id };
-  }
-
-  try {
-    const rawServers = window.localStorage.getItem(MCP_SERVER_STORAGE_KEY);
-    const rawActiveServerId = window.localStorage.getItem(ACTIVE_MCP_SERVER_STORAGE_KEY);
-    const parsedServers = rawServers ? (JSON.parse(rawServers) as McpServerConfig[]) : [];
-    const servers = sanitizeMcpServers(parsedServers, defaultUrl);
-    const activeServerId =
-      rawActiveServerId && servers.some((server) => server.id === rawActiveServerId)
-        ? rawActiveServerId
-        : servers[0].id;
-
-    return { servers, activeServerId };
-  } catch {
-    const fallback = getDefaultMcpServerConfig(defaultUrl);
-    return { servers: [fallback], activeServerId: fallback.id };
-  }
-}
-
-function getMcpStatusPresentation(health?: McpServerHealthState): { color: string; text: string } {
-  if (!health) {
-    return { color: "#6b6b6b", text: "Not checked yet." };
-  }
-
-  if (health.status === "ok") {
-    return { color: "#2d6a4f", text: health.message };
-  }
-
-  if (health.status === "checking") {
-    return { color: "#6b6b6b", text: health.message };
-  }
-
-  return { color: "#8a1f11", text: health.message };
-}
 
 function ensureAssistantUserBubbleStyle(cardElement: Element): void {
   const shadowRoot = (cardElement as HTMLElement).shadowRoot;
@@ -276,22 +165,14 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [showSignOutConfirm, setShowSignOutConfirm] = useState(false);
-  const [showMcpConfigDialog, setShowMcpConfigDialog] = useState(false);
+  const [showHubManager, setShowHubManager] = useState(false);
+  const [showEmbeddingRegenerateButton, setShowEmbeddingRegenerateButton] = useState(false);
   const [isEmbeddingBusy, setIsEmbeddingBusy] = useState(false);
   const [embeddingsStatusMessage, setEmbeddingsStatusMessage] = useState<string | null>(null);
   const [embeddingsError, setEmbeddingsError] = useState<string | null>(null);
-  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>(() => loadMcpServerConfig(defaultMcpBaseUrl).servers);
-  const [activeMcpServerId, setActiveMcpServerId] = useState<string>(
-    () => loadMcpServerConfig(defaultMcpBaseUrl).activeServerId
-  );
-  const [draftMcpServers, setDraftMcpServers] = useState<McpServerConfig[]>([]);
-  const [draftActiveMcpServerId, setDraftActiveMcpServerId] = useState<string>("");
-  const [mcpHealthByServerId, setMcpHealthByServerId] = useState<Record<string, McpServerHealthState>>({});
   const autoCheckedMapIdRef = useRef<string | null>(null);
-  const activeMcpServer = mcpServers.find((server) => server.id === activeMcpServerId) || mcpServers[0];
-  const arcgisMcpBaseUrl = activeMcpServer?.url || defaultMcpBaseUrl;
-  const activeMcpHealth = activeMcpServer ? mcpHealthByServerId[activeMcpServer.id] : undefined;
-  const mcpError = activeMcpHealth?.status === "error" ? activeMcpHealth.message : null;
+  const changeMapButtonCleanupRef = useRef<(() => void) | null>(null);
+  const mcpButtonCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (!webMapId) return;
@@ -308,10 +189,11 @@ export default function App() {
         "You are a strict information extraction assistant. Extract the requested feature layer details from the user text and return only valid JSON. Schema: {\"name\": string|null, \"geometryType\": \"point\"|\"polyline\"|\"polygon\"|null, \"fields\": [{\"name\": string, \"type\": string}]|null}. Do not include any extra keys or commentary.",
     });
     registerFeatureLayerCapabilitiesAgent(assistant);
-    registerArcgisMcpPassthroughAgent(assistant, {
-      baseUrl: arcgisMcpBaseUrl,
+    registerMcpPassthroughAgent(assistant, {
+      baseUrl: defaultMcpBaseUrl,
+      serverName: "MCP Hub",
     });
-  }, [arcgisMcpBaseUrl, oauthClientId, portalUrl, webMapId]);
+  }, [defaultMcpBaseUrl, oauthClientId, portalUrl, webMapId]);
 
   useEffect(() => {
     if (!webMapId) return;
@@ -321,68 +203,6 @@ export default function App() {
 
     return installAssistantUserBubbleStyler(assistant);
   }, [webMapId]);
-
-  useEffect(() => {
-    if (!mcpServers.length) {
-      setMcpHealthByServerId({});
-      return;
-    }
-
-    let cancelled = false;
-
-    setMcpHealthByServerId((current) => {
-      const next: Record<string, McpServerHealthState> = {};
-      for (const server of mcpServers) {
-        next[server.id] = {
-          status: "checking",
-          message: current[server.id]?.status === "ok" ? current[server.id].message : "Checking MCP server...",
-        };
-      }
-      return next;
-    });
-
-    void Promise.all(
-      mcpServers.map(async (server) => {
-        try {
-          const health = await getArcgisMcpHealth(server.url);
-          if (cancelled) return;
-          const summary = typeof health.status === "string" ? health.status : "connected";
-          setMcpHealthByServerId((current) => ({
-            ...current,
-            [server.id]: {
-              status: "ok",
-              message: `Connection ok: ${summary}`,
-            },
-          }));
-        } catch (error: any) {
-          if (cancelled) return;
-          setMcpHealthByServerId((current) => ({
-            ...current,
-            [server.id]: {
-              status: "error",
-              message: error?.message || "Unable to reach this MCP server.",
-            },
-          }));
-        }
-      })
-    );
-
-    return () => {
-      cancelled = true;
-    };
-  }, [mcpServers]);
-
-  useEffect(() => {
-    if (!mcpServers.some((server) => server.id === activeMcpServerId)) {
-      setActiveMcpServerId(mcpServers[0]?.id || "");
-    }
-  }, [activeMcpServerId, mcpServers]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(MCP_SERVER_STORAGE_KEY, JSON.stringify(mcpServers));
-    window.localStorage.setItem(ACTIVE_MCP_SERVER_STORAGE_KEY, activeMcpServerId);
-  }, [activeMcpServerId, mcpServers]);
 
   useEffect(() => {
     document.title = appName;
@@ -440,50 +260,87 @@ export default function App() {
     setShowSignOutConfirm(false);
   };
 
-  const openMcpConfig = () => {
-    setDraftMcpServers(mcpServers.map((server) => ({ ...server })));
-    setDraftActiveMcpServerId(activeMcpServerId);
-    setShowMcpConfigDialog(true);
-  };
+  const handleChangeWebMapClick = useCallback(() => {
+    setWebMapId("");
+    setEmbeddingsStatusMessage(null);
+    setEmbeddingsError(null);
+    autoCheckedMapIdRef.current = null;
+  }, []);
 
-  const handleAddMcpServer = () => {
-    const nextServer = createMcpServerConfig("", `MCP server ${draftMcpServers.length + 1}`);
-    setDraftMcpServers((current) => [...current, nextServer]);
-    setDraftActiveMcpServerId((current) => current || nextServer.id);
-  };
-
-  const handleDraftMcpServerChange = (serverId: string, field: "label" | "url", value: string) => {
-    setDraftMcpServers((current) =>
-      current.map((server) => (server.id === serverId ? { ...server, [field]: value } : server))
+  const handleMcpButtonClick = useCallback((event?: MouseEvent) => {
+    // Easter egg: macOS Command+Shift+click, Windows/Linux Control+Shift+click.
+    const isMac =
+      typeof navigator !== "undefined" &&
+      /Mac|iPhone|iPad|iPod/i.test(navigator.platform || "");
+    const hasUnlockModifiers = Boolean(
+      event && event.shiftKey && (isMac ? event.metaKey : event.ctrlKey),
     );
-  };
 
-  const handleRemoveDraftMcpServer = (serverId: string) => {
-    setDraftMcpServers((current) => {
-      const next = current.filter((server) => server.id !== serverId);
-      if (!next.length) {
-        const fallback = getDefaultMcpServerConfig(defaultMcpBaseUrl);
-        setDraftActiveMcpServerId(fallback.id);
-        return [fallback];
+    if (hasUnlockModifiers) {
+      setShowEmbeddingRegenerateButton((prev) => !prev);
+      return;
+    }
+
+    setShowHubManager(true);
+  }, []);
+
+  const bindChangeMapButton = useCallback(
+    (el: HTMLElement | null) => {
+      if (changeMapButtonCleanupRef.current) {
+        changeMapButtonCleanupRef.current();
+        changeMapButtonCleanupRef.current = null;
       }
-      if (draftActiveMcpServerId === serverId) {
-        setDraftActiveMcpServerId(next[0].id);
+
+      if (!el) return;
+
+      const onClick = () => {
+        handleChangeWebMapClick();
+      };
+
+      el.addEventListener("click", onClick);
+      changeMapButtonCleanupRef.current = () => {
+        el.removeEventListener("click", onClick);
+      };
+    },
+    [handleChangeWebMapClick],
+  );
+
+  const bindMcpButton = useCallback(
+    (el: HTMLElement | null) => {
+      if (mcpButtonCleanupRef.current) {
+        mcpButtonCleanupRef.current();
+        mcpButtonCleanupRef.current = null;
       }
-      return next;
-    });
-  };
 
-  const handleSaveMcpConfig = () => {
-    const nextServers = sanitizeMcpServers(draftMcpServers, defaultMcpBaseUrl);
-    const nextActiveServerId =
-      nextServers.some((server) => server.id === draftActiveMcpServerId)
-        ? draftActiveMcpServerId
-        : nextServers[0].id;
+      if (!el) return;
 
-    setMcpServers(nextServers);
-    setActiveMcpServerId(nextActiveServerId);
-    setShowMcpConfigDialog(false);
-  };
+      const onClick = (event: Event) => {
+        handleMcpButtonClick(event as MouseEvent);
+      };
+
+      el.addEventListener("click", onClick);
+      mcpButtonCleanupRef.current = () => {
+        el.removeEventListener("click", onClick);
+      };
+    },
+    [handleMcpButtonClick],
+  );
+
+  useEffect(
+    () => () => {
+      if (changeMapButtonCleanupRef.current) {
+        changeMapButtonCleanupRef.current();
+        changeMapButtonCleanupRef.current = null;
+      }
+      if (mcpButtonCleanupRef.current) {
+        mcpButtonCleanupRef.current();
+        mcpButtonCleanupRef.current = null;
+      }
+    },
+    [],
+  );
+
+
 
   const renderAccountMenu = () => (
     <calcite-dropdown placement="bottom-end" type="click" scale="m">
@@ -645,32 +502,30 @@ export default function App() {
                 <div style={headerActionsContainerStyle}>
                   <div style={headerActionIconsRowStyle}>
                     <calcite-button
+                      ref={bindChangeMapButton as any}
                       appearance="transparent"
                       icon-start="map"
                       scale={headerActionButtonScale}
-                      onClick={() => {
-                        setWebMapId("");
-                        setEmbeddingsStatusMessage(null);
-                        setEmbeddingsError(null);
-                        autoCheckedMapIdRef.current = null;
-                      }}
                       title="Change WebMap"
                     ></calcite-button>
+                    {showEmbeddingRegenerateButton && (
+                      <calcite-button
+                        appearance="transparent"
+                        icon-start="reset"
+                        scale={headerActionButtonScale}
+                        onClick={() => {
+                          if (isEmbeddingBusy) return;
+                          void ensureWebMapEmbeddings(true);
+                        }}
+                        title="Regenerate embeddings"
+                      ></calcite-button>
+                    )}
                     <calcite-button
-                      appearance="transparent"
-                      icon-start="reset"
-                      scale={headerActionButtonScale}
-                      onClick={() => {
-                        if (isEmbeddingBusy) return;
-                        void ensureWebMapEmbeddings(true);
-                      }}
-                      title="Regenerate embeddings"
-                    ></calcite-button>
-                    <calcite-button
+                      ref={bindMcpButton as any}
                       appearance="transparent"
                       scale={headerActionButtonScale}
-                      onClick={openMcpConfig}
-                      title="Configure MCP servers"
+                      title="Manage MCP servers"
+                      aria-label="Manage MCP servers"
                     >
                       <span aria-hidden="true" style={mcpIconStyle}></span>
                     </calcite-button>
@@ -681,13 +536,13 @@ export default function App() {
               <arcgis-assistant
                 reference-element="#main-map"
                 heading={appName}
-                description="Ask questions about the current web map, get data insights, or request geospatial analysis."
+                description="Ask map questions, or external questions that should be answered via configured MCP tools."
               >
                 <arcgis-assistant-navigation-agent></arcgis-assistant-navigation-agent>
                 <arcgis-assistant-data-exploration-agent></arcgis-assistant-data-exploration-agent>
                 {/* Custom agent is appended programmatically via useEffect */}
               </arcgis-assistant>
-              {(embeddingsStatusMessage || embeddingsError || mcpError) && (
+              {(embeddingsStatusMessage || embeddingsError) && (
                 <div style={{ padding: "0.5rem 1rem 1rem", fontSize: "0.85rem" }}>
                   {embeddingsStatusMessage && (
                     <div style={{ color: "#4a4a4a" }}>
@@ -697,17 +552,6 @@ export default function App() {
                   {embeddingsError && (
                     <div style={{ color: "#8a1f11", marginTop: embeddingsStatusMessage ? "0.35rem" : 0 }}>
                       {embeddingsError}
-                    </div>
-                  )}
-                  {mcpError && (
-                    <div
-                      style={{
-                        color: "#8a1f11",
-                        marginTop:
-                          embeddingsStatusMessage || embeddingsError ? "0.35rem" : 0,
-                      }}
-                    >
-                      {mcpError}
                     </div>
                   )}
                 </div>
@@ -720,6 +564,7 @@ export default function App() {
       {showSignOutConfirm && (
         <calcite-dialog
           open
+          overlay-positioning="fixed"
           heading="Sign out"
           onCalciteDialogClose={() => setShowSignOutConfirm(false)}
         >
@@ -745,93 +590,7 @@ export default function App() {
         </calcite-dialog>
       )}
 
-      {showMcpConfigDialog && (
-        <calcite-dialog
-          open
-          heading="Configure MCP servers"
-          onCalciteDialogClose={() => setShowMcpConfigDialog(false)}
-        >
-          <div style={dialogBodyStyle}>
-            <div style={{ color: "#4a4a4a", lineHeight: 1.5 }}>
-              Add one or more MCP servers here. The assistant uses the selected active server, while the others remain saved for quick switching.
-            </div>
-
-            {draftMcpServers.map((server, index) => {
-              const status = getMcpStatusPresentation(mcpHealthByServerId[server.id]);
-
-              return (
-                <div key={server.id} style={mcpServerCardStyle}>
-                  <div style={mcpServerHeaderStyle}>
-                    <label style={mcpServerRadioLabelStyle}>
-                      <input
-                        type="radio"
-                        name="active-mcp-server"
-                        checked={draftActiveMcpServerId === server.id}
-                        onChange={() => setDraftActiveMcpServerId(server.id)}
-                      />
-                      Active server
-                    </label>
-                    <calcite-button
-                      appearance="transparent"
-                      kind="neutral"
-                      icon-start="trash"
-                      scale="s"
-                      onClick={() => handleRemoveDraftMcpServer(server.id)}
-                      title="Remove MCP server"
-                    ></calcite-button>
-                  </div>
-
-                  <label>
-                    <div style={{ marginBottom: "0.35rem", color: "#3c3c3c", fontWeight: 600 }}>
-                      Name
-                    </div>
-                    <input
-                      value={server.label}
-                      onChange={(event) => handleDraftMcpServerChange(server.id, "label", event.target.value)}
-                      placeholder={`MCP server ${index + 1}`}
-                      style={secondaryInputStyle}
-                    />
-                  </label>
-
-                  <label>
-                    <div style={{ marginBottom: "0.35rem", color: "#3c3c3c", fontWeight: 600 }}>
-                      Base URL
-                    </div>
-                    <input
-                      value={server.url}
-                      onChange={(event) => handleDraftMcpServerChange(server.id, "url", event.target.value)}
-                      placeholder="http://127.0.0.1:8000 or /api/arcgis-mcp"
-                      style={secondaryInputStyle}
-                    />
-                  </label>
-
-                  <div style={{ color: status.color, fontSize: "0.85rem" }}>
-                    {status.text}
-                  </div>
-                </div>
-              );
-            })}
-
-            <div>
-              <calcite-button appearance="outline" kind="neutral" icon-start="plus" onClick={handleAddMcpServer}>
-                Add MCP server
-              </calcite-button>
-            </div>
-          </div>
-
-          <calcite-button
-            slot="footer-start"
-            appearance="outline"
-            kind="neutral"
-            onClick={() => setShowMcpConfigDialog(false)}
-          >
-            Cancel
-          </calcite-button>
-          <calcite-button slot="footer-end" appearance="solid" kind="brand" onClick={handleSaveMcpConfig}>
-            Save MCP servers
-          </calcite-button>
-        </calcite-dialog>
-      )}
+      <HubServerManager open={showHubManager} onClose={useCallback(() => setShowHubManager(false), [])} />
     </calcite-shell>
   );
 }

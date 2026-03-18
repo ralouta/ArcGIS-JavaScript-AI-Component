@@ -93,8 +93,11 @@ function normalizeArrayResponse<T>(payload: unknown, key: string): T[] {
 }
 
 export function resolveArcgisMcpBaseUrl(): string {
-  const configured = (import.meta.env.VITE_ARCGIS_MCP_BASE_URL as string | undefined)?.trim();
-  return configured || "/api/arcgis-mcp";
+  // VITE_MCP_BASE_URL takes precedence; fall back to old name for backward compat.
+  const configured =
+    (import.meta.env.VITE_MCP_BASE_URL as string | undefined)?.trim() ||
+    (import.meta.env.VITE_ARCGIS_MCP_BASE_URL as string | undefined)?.trim();
+  return configured || "/api/mcp";
 }
 
 export async function getArcgisMcpHealth(baseUrl = resolveArcgisMcpBaseUrl()): Promise<ArcgisMcpHealth> {
