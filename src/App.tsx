@@ -28,7 +28,7 @@ import {
 
 const LAST_WEBMAP_STORAGE_KEY = "arcgis-assistant:last-webmap";
 const NEW_WEBMAP_TITLE = "New Map";
-const NEW_WEBMAP_SNIPPET = "Created in ArcGIS Agent Components and saved to ArcGIS Online immediately.";
+const NEW_WEBMAP_SNIPPET = "Created in ArcGIS Agent Components Demo and saved to ArcGIS Online immediately.";
 const CREATE_NEW_FOLDER_OPTION = "__create_new_folder__";
 const ROOT_FOLDER_OPTION = "__root_folder__";
 const SUMMARY_CHAR_LIMIT = 2048;
@@ -467,7 +467,7 @@ function installAssistantUserBubbleStyler(assistant: HTMLElement): () => void {
 export default function App() {
   const clientParams = getClientQueryParams();
   const appMode = resolveAppMode(clientParams);
-  const appName = (import.meta.env.VITE_APP_NAME as string | undefined)?.trim() || "ArcGIS Agent Components";
+  const appName = (import.meta.env.VITE_APP_NAME as string | undefined)?.trim() || "ArcGIS Agent Components Demo";
   const pageHeaderTitle = appName;
   const pageHeaderSubtitle = "Map exploration, MCP-assisted research, and feature editing in one workspace.";
   const showHeaderSubtitle = true;

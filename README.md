@@ -1,4 +1,4 @@
-# ArcGIS Agent Components
+# ArcGIS Agent Components Demo
 
 React + Vite app built with ArcGIS Maps SDK, ArcGIS Assistant components, and an MCP hub.
 
@@ -8,7 +8,7 @@ Most of this app has been vibe coded with various coding agents. Review the code
 
 ## Hosted App
 
-- [ArcGIS Agent Components](https://ralouta.github.io/ArcGIS-JavaScript-AI-Component/)
+- [ArcGIS Agent Components Demo](https://ralouta.github.io/ArcGIS-JavaScript-AI-Component/)
 
 ## What It Does
 
@@ -54,7 +54,7 @@ Create `.env.local` in the project root:
 ```bash
 VITE_ARCGIS_OAUTH_APP_ID=your-client-id
 VITE_ARCGIS_PORTAL_URL=https://www.arcgis.com
-VITE_APP_NAME=ArcGIS Agent Components
+VITE_APP_NAME=ArcGIS Agent Components Demo
 ```
 
 ### 4. Configure ArcGIS OAuth
