@@ -5,7 +5,8 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 export interface HubServer {
   id: string;
   label: string;
-  transport: "stdio" | string;
+  transport: "stdio" | "url" | string;
+  url: string | null;
   command: string | null;
   args: string[];
   env: Record<string, string>;
@@ -23,7 +24,9 @@ interface EnvEntry {
 }
 
 interface DraftServer {
+  transport: "stdio" | "url";
   label: string;
+  url: string;
   command: string;
   argsText: string;
   envEntries: EnvEntry[];
@@ -155,7 +158,9 @@ function entriesToEnv(entries: EnvEntry[]): Record<string, string> {
 
 function emptyDraft(): DraftServer {
   return {
+    transport: "stdio",
     label: "",
+    url: "",
     command: "",
     argsText: "",
     envEntries: [{ key: "", value: "" }],
@@ -165,7 +170,9 @@ function emptyDraft(): DraftServer {
 
 function serverToDraft(s: HubServer): DraftServer {
   return {
+    transport: s.transport === "url" ? "url" : "stdio",
     label: s.label,
+    url: s.url ?? "",
     command: s.command ?? "",
     argsText: argsToText(s.args),
     envEntries: envToEntries(s.env),
@@ -174,6 +181,14 @@ function serverToDraft(s: HubServer): DraftServer {
 }
 
 function draftToPayload(draft: DraftServer, enabled: boolean) {
+  if (draft.transport === "url") {
+    return {
+      label: draft.label.trim() || "Untitled",
+      transport: "url",
+      url: draft.url.trim(),
+      enabled,
+    };
+  }
   return {
     label: draft.label.trim() || "Untitled",
     transport: "stdio",
@@ -186,6 +201,7 @@ function draftToPayload(draft: DraftServer, enabled: boolean) {
 }
 
 function isDraftValid(draft: DraftServer): boolean {
+  if (draft.transport === "url") return !!draft.url.trim();
   return !!draft.command.trim();
 }
 
@@ -512,7 +528,34 @@ export default function HubServerManager({ open, onClose }: Props) {
   const renderForm = () => (
     <div style={{ ...cardStyle, borderColor: "#007ac2" }}>
       <div style={{ ...labelTextStyle, marginBottom: "0.25rem" }}>
-        {addingNew ? "Add MCP Server" : "Edit MCP Server"}
+        {addingNew ? "Add MCP server" : "Edit MCP server"}
+      </div>
+
+      {/* Transport type selector */}
+      <div>
+        <div style={{ ...labelTextStyle, fontSize: "0.85rem", marginBottom: "0.35rem" }}>
+          Type
+        </div>
+        <div style={{ display: "flex", gap: "0.4rem" }}>
+          {(["stdio", "url"] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => updateDraft("transport", t)}
+              style={{
+                padding: "0.3rem 0.8rem",
+                borderRadius: "4px",
+                border: draft.transport === t ? "2px solid #007ac2" : "1px solid #c7c7c7",
+                background: draft.transport === t ? "#e8f4fc" : "#fff",
+                color: draft.transport === t ? "#007ac2" : "#3c3c3c",
+                fontWeight: draft.transport === t ? 600 : 400,
+                fontSize: "0.85rem",
+                cursor: "pointer",
+              }}
+            >
+              {t === "stdio" ? "Command (stdio)" : "HTTP URL"}
+            </button>
+          ))}
+        </div>
       </div>
 
       <label>
@@ -533,16 +576,38 @@ export default function HubServerManager({ open, onClose }: Props) {
         />
       </label>
 
-      <div
-        style={{
-          fontSize: "0.75rem",
-          color: "#6a6a6a",
-        }}
-      >
-        Run any MCP server through a command (npx, node, python, uvx, etc.).
-      </div>
+      {draft.transport === "url" ? (
+        <>
+          <div style={{ fontSize: "0.75rem", color: "#6a6a6a" }}>
+            Connect directly to a running streamable HTTP or SSE MCP server.
+          </div>
+          <label>
+            <div style={{ ...labelTextStyle, fontSize: "0.85rem", marginBottom: "0.2rem" }}>
+              Server URL
+            </div>
+            <input
+              style={inputStyle}
+              value={draft.url}
+              onChange={(e) => updateDraft("url", e.target.value)}
+              placeholder="https://example.com/mcp"
+              type="url"
+            />
+            <div style={{ fontSize: "0.75rem", color: "#6a6a6a", marginTop: "0.15rem" }}>
+              Streamable HTTP is tried first; falls back to SSE automatically.
+            </div>
+          </label>
+        </>
+      ) : (
+        <>
+          <div
+            style={{
+              fontSize: "0.75rem",
+              color: "#6a6a6a",
+            }}
+          >
+            Run any MCP server through a command (npx, node, python, uvx, etc.).
+          </div>
 
-      <>
           <label>
             <div
               style={{
@@ -658,7 +723,8 @@ export default function HubServerManager({ open, onClose }: Props) {
               placeholder="/path/to/project"
             />
           </label>
-      </>
+        </>
+      )}
 
       <div
         style={{
@@ -762,7 +828,7 @@ export default function HubServerManager({ open, onClose }: Props) {
                   onClick={importServers}
                   disabled={busy || !importText.trim() || undefined}
                 >
-                  Import JSON
+                  Import json
                 </calcite-button>
               </div>
             </div>
@@ -846,7 +912,9 @@ export default function HubServerManager({ open, onClose }: Props) {
                       fontFamily: "monospace",
                     }}
                   >
-                      {`${server.command} ${server.args.join(" ")}`}
+                    {server.transport === "url"
+                      ? server.url ?? ""
+                      : `${server.command} ${server.args.join(" ")}`}
                   </div>
                     {Object.keys(server.env).length > 0 && (
                     <div

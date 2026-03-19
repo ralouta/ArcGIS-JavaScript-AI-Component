@@ -34,7 +34,7 @@ interface ServerConfig {
   label: string;
   /** "url" = bridge to running server; "stdio" = spawn local process. */
   transport: "url" | "stdio";
-  /** For transport "url": the endpoint URL (e.g. http://host:port/sse). */
+  /** For transport "url": the endpoint URL (e.g. http://host:port/mcp). */
   url?: string;
   /** For transport "stdio": the executable to run. */
   command?: string;
@@ -265,16 +265,19 @@ async function startServer(state: ServerState): Promise<void> {
       if (!state.config.url) throw new Error("url is required for url transport");
       const endpoint = new URL(state.config.url);
 
-      // Try StreamableHTTP first (/mcp style), fall back to SSE (/sse style).
+      // Try streamable HTTP first (MCP 2025-03-26); fall back to SSE only when
+      // the error is NOT a 404, which would mean SSE will also fail.
       try {
         const streamable = new StreamableHTTPClientTransport(endpoint);
-        // Validate connectivity by attempting connect on a temp client.
         const probe = new Client({ name: "mcp-hub/probe", version: "1.0.0" });
         await probe.connect(streamable);
         await probe.close();
-        // Reconnect with a fresh transport for the real client.
         transport = new StreamableHTTPClientTransport(endpoint);
-      } catch {
+      } catch (probeErr: any) {
+        const msg: string = probeErr?.message ?? "";
+        if (/\b404\b|not found/i.test(msg)) {
+          throw new Error(`Cannot connect to MCP server at ${state.config.url} (${msg}). Check the URL.`);
+        }
         transport = new SSEClientTransport(endpoint);
       }
     }
@@ -286,11 +289,20 @@ async function startServer(state: ServerState): Promise<void> {
 
     await client.connect(transport);
 
+    // Strip null nextCursor from responses so strict Zod schema doesn't reject
+    // servers that send nextCursor: null instead of omitting the field.
+    const origOnMessage = transport.onmessage;
+    transport.onmessage = (msg: any) => {
+      if (msg?.result != null && "nextCursor" in msg.result && msg.result.nextCursor === null) {
+        delete msg.result.nextCursor;
+      }
+      origOnMessage?.(msg);
+    };
+
     state.client = client;
     state.activeTransport = transport;
     state.status = "running";
 
-    // Discover tools
     const { tools } = await client.listTools();
     state.tools = tools.map((t) => ({
       name: t.name,

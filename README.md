@@ -1,22 +1,19 @@
 # ArcGIS Assistant Demo
 
-React + Vite demo built with ArcGIS Maps SDK and ArcGIS Assistant.
+React + Vite demo built with ArcGIS Maps SDK, ArcGIS Assistant, and an MCP hub.
 
-**What it does:**
-- Sign in with ArcGIS, load a WebMap by item ID
-- Ask the assistant questions about the map (navigation, data exploration)
-- Create hosted feature layers from natural language
-- Connect external MCP servers and use their tools directly in the assistant
+## What It Does
 
----
+- Sign in with ArcGIS and load an existing WebMap or create a new one.
+- Use built-in map-aware assistant tools for navigation and data exploration.
+- Use MCP-backed tools for external workflows such as weather, catalog, or custom server tasks.
+- Create and manage hosted feature layers from assistant results.
 
 ## Requirements
 
 - Node.js 18+
-- ArcGIS OAuth client ID
-- A WebMap item ID to load
-
----
+- An ArcGIS OAuth client ID
+- A WebMap item ID to load, or permission to create WebMaps in your ArcGIS org
 
 ## Setup
 
@@ -32,102 +29,88 @@ Create `.env.local` in the project root:
 
 ```bash
 VITE_ARCGIS_OAUTH_APP_ID=your-client-id
-VITE_ARCGIS_PORTAL_URL=https://www.arcgis.com   # omit for ArcGIS Online default
-VITE_APP_NAME=ArcGIS Assistant Demo              # optional
+VITE_ARCGIS_PORTAL_URL=https://www.arcgis.com
+VITE_APP_NAME=ArcGIS Assistant Demo
 ```
 
 ### 3. ArcGIS OAuth App
 
-1. Sign in to your ArcGIS portal and create an OAuth app.
+1. Create an ArcGIS OAuth app.
 2. Add redirect URLs: `http://localhost:5173` and `http://localhost:4173`.
 3. Copy the client ID into `VITE_ARCGIS_OAUTH_APP_ID`.
-
----
 
 ## Run
 
 ```bash
-npm run dev       # start the app
-npm run hub       # start the MCP hub (required for MCP features)
-npm run hub:dev   # start the MCP hub in watch mode
-npm run build     # production build
-npm run preview   # preview the build
+npm run dev
+npm run hub
+npm run hub:dev
+npm run build
+npm run preview
 ```
 
-Run the app and hub in separate terminals.
+Run the app and hub in separate terminals when using MCP features.
 
----
-
-## Using the App
+## Using The App
 
 1. Sign in with ArcGIS.
-2. Enter a WebMap item ID and click **Load map**.
-3. Ask the assistant anything about the map.
+2. Load a WebMap by item ID, or create a new map.
+3. Ask map questions, run MCP-backed prompts, or create/manage hosted layers.
 
-**Demo WebMap ID:**
-```
+Demo WebMap ID:
+
+```text
 0cafaf0aa4174e5bac19113ab69bdc85
 ```
 
-**Example prompts:**
+Example prompts:
+
 - `what layers are in this webmap?`
 - `navigate me to baalbek`
+- `get the weather forecast for Beirut`
 - `create a point layer named Sites with fields: Name:string, Category:string`
-- `get the weather forecast for Beirut` *(requires a weather MCP server)*
-
----
-
-## Feature Layer Creation
-
-Ask the assistant to create hosted feature layers:
-
-- `Create a point layer named Facilities with fields: Name:string, Capacity:int`
-- `Create a polygon layer called Zoning with fields: Zone:string, MaxHeight:int`
-- `Create a polyline layer named Trails with fields: Name:string, Length:double`
-
----
+- `add the latest results to the last created feature layer`
 
 ## MCP Hub
 
-The app ships with a local MCP hub (`hub/server.ts`) that aggregates multiple MCP servers into a single endpoint the assistant can query.
+The local hub in `hub/server.ts` aggregates multiple MCP servers behind one endpoint.
 
-### Start the hub
+You can add servers in two ways from the MCP manager:
 
-```bash
-npm run hub
-```
+- Command-based `stdio` servers such as `npx`, `node`, `python`, or `uvx`
+- Direct HTTP MCP server URLs
 
-### Add MCP servers
+Example remote bridge via `mcp-remote`:
 
-Click the **MCP icon** (⚙) in the assistant panel header to open the server manager. From there you can:
-
-- **Add a server** — specify a command, arguments, and optional env vars. Any launch pattern works: `npx`, `node`, `python`, `uvx`, etc.
-- **Import from desktop config** — paste a JSON snippet in the standard `mcpServers` / `command` / `args` / `env` format.
-- **Start / stop / remove** servers at runtime.
-
-To bridge to a remote MCP server over stdio, use `npx mcp-remote` as the command:
-
-```
+```text
 Command:   npx
 Arguments: mcp-remote https://your-remote-mcp-server.com/mcp
 ```
 
 The hub runs on port `8808` by default and is proxied through Vite at `/api/mcp` during development.
 
----
+## Assistant Notes
 
-## Embeddings
-
-The app auto-generates WebMap embeddings on first load. Weak answers usually mean stale embeddings — regenerate them to fix.
-
----
+- The assistant stays available even on empty maps.
+- Map-aware built-in tools wait until the map is ready and assistant data has been prepared.
+- Empty maps still support MCP and custom assistant workflows.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Sign-in fails | Check `VITE_ARCGIS_OAUTH_APP_ID` and redirect URLs |
-| Map won't load | Verify WebMap ID and its sharing permissions |
-| MCP tools unavailable | Confirm `npm run hub` is running and the server status shows green |
-| Feature layer creation fails | Verify your account has permission to create hosted feature layers |
-| Weak map answers | Regenerate WebMap embeddings |
+| Map will not load | Verify the WebMap ID and sharing permissions |
+| MCP tools are unavailable | Confirm `npm run hub` is running and the server status is healthy |
+| Feature layer creation fails | Verify the account can create hosted feature layers |
+| Map-aware answers are weak | Refresh assistant data for the current map |
+
+## URL Parameters
+
+The only supported URL parameter is `?mode=edit`.
+
+Use it when you want the wider assistant panel and the theme editor controls:
+
+```text
+http://localhost:5173/?mode=edit
+```

@@ -2,6 +2,7 @@
 import esriConfig from "@arcgis/core/config";
 import IdentityManager from "@arcgis/core/identity/IdentityManager";
 import OAuthInfo from "@arcgis/core/identity/OAuthInfo";
+import Portal from "@arcgis/core/portal/Portal";
 
 export interface CredentialInfo {
   token: string;
@@ -24,6 +25,30 @@ export function initializeOAuth(
 
   IdentityManager.registerOAuthInfos([info]);
   return info;
+}
+
+/**
+ * Fetch the title of an ArcGIS portal item by its item ID.
+ * Returns null if the item cannot be reached or the token is missing.
+ */
+export async function fetchPortalItemTitle(
+  portalUrl: string,
+  itemId: string,
+  token?: string,
+): Promise<string | null> {
+  if (!itemId) return null;
+  try {
+    const base = portalUrl.replace(/\/$/, "");
+    const url = `${base}/sharing/rest/content/items/${encodeURIComponent(itemId)}?f=json${
+      token ? `&token=${encodeURIComponent(token)}` : ""
+    }`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return typeof json?.title === "string" ? json.title : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function getCredential(
@@ -88,6 +113,62 @@ export interface GenerateWebMapEmbeddingsResult {
   fieldCount?: number;
 }
 
+export interface CreateWebMapItemParams {
+  portalUrl: string;
+  token: string;
+  username: string;
+  title: string;
+  text: Record<string, any>;
+  folderId?: string;
+  snippet?: string;
+  description?: string;
+  tags?: string[];
+  categories?: string[];
+}
+
+export interface CreateWebMapItemResult {
+  success: boolean;
+  message: string;
+  itemId?: string;
+}
+
+export interface UpdateWebMapItemParams {
+  portalUrl: string;
+  token: string;
+  username: string;
+  itemId: string;
+  text: Record<string, any>;
+  title?: string;
+  snippet?: string;
+  description?: string;
+  tags?: string[];
+}
+
+export interface PortalItemMutationResult {
+  success: boolean;
+  message: string;
+}
+
+export interface UserFolderInfo {
+  id: string;
+  title: string;
+}
+
+export interface PortalCategoryOption {
+  value: string;
+  label: string;
+}
+
+export interface PortalTagInfo {
+  tag: string;
+  count: number;
+}
+
+interface PortalCategoryNode {
+  title?: string;
+  categories?: PortalCategoryNode[];
+}
+
 interface LayerEmbeddingRecord {
   id: string;
   name: string;
@@ -133,6 +214,19 @@ function buildUserItemUrl(
   return `${portalUrl}/sharing/rest/content/users/${encodeURIComponent(owner)}${folderPath}/items/${encodeURIComponent(itemId)}/${operation}`;
 }
 
+function buildUserRootContentUrl(portalUrl: string, owner: string, operation: "addItem") {
+  return `${portalUrl}/sharing/rest/content/users/${encodeURIComponent(owner)}/${operation}`;
+}
+
+function buildUserFolderContentUrl(
+  portalUrl: string,
+  owner: string,
+  folderId: string,
+  operation: "addItem"
+) {
+  return `${portalUrl}/sharing/rest/content/users/${encodeURIComponent(owner)}/${encodeURIComponent(folderId)}/${operation}`;
+}
+
 async function fetchJson<T = any>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   const json = await response.json();
@@ -168,6 +262,33 @@ async function listItemResources(
 
 function safeString(value: any): string {
   return typeof value === "string" ? value : "";
+}
+
+function normalizePortalUrl(portalUrl: string): string {
+  return portalUrl.replace(/\/$/, "");
+}
+
+function flattenCategoryNodes(
+  nodes: PortalCategoryNode[],
+  parentPath: string[] = [],
+  options: PortalCategoryOption[] = []
+): PortalCategoryOption[] {
+  for (const node of nodes) {
+    const title = safeString(node?.title).trim();
+    if (!title) continue;
+
+    const pathSegments = [...parentPath, title];
+    options.push({
+      value: `/${pathSegments.join("/")}`,
+      label: pathSegments.join(" > "),
+    });
+
+    if (Array.isArray(node?.categories) && node.categories.length) {
+      flattenCategoryNodes(node.categories, pathSegments, options);
+    }
+  }
+
+  return options;
 }
 
 function normalizeServiceUrl(value: any): string {
@@ -317,6 +438,211 @@ export async function getWebMapEmbeddingsStatus(
     owner,
     ownerFolder,
   };
+}
+
+export async function createWebMapItem(
+  params: CreateWebMapItemParams
+): Promise<CreateWebMapItemResult> {
+  const { portalUrl, token, username, title, text, folderId, snippet, description, tags, categories } = params;
+  const url = folderId?.trim()
+    ? buildUserFolderContentUrl(portalUrl, username, folderId.trim(), "addItem")
+    : buildUserRootContentUrl(portalUrl, username, "addItem");
+  const body = new URLSearchParams({
+    f: "json",
+    token,
+    title,
+    type: "Web Map",
+    text: JSON.stringify(text),
+  });
+
+  if (snippet?.trim()) body.set("snippet", snippet.trim());
+  if (description?.trim()) body.set("description", description.trim());
+  if (tags?.length) body.set("tags", tags.join(","));
+  if (categories?.length) body.set("categories", categories.join(","));
+
+  const json = await fetchJson<any>(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (json?.error) {
+    return { success: false, message: json.error?.message || "Failed to create WebMap item." };
+  }
+
+  const itemId = safeString(json?.id || json?.itemId);
+  if (!itemId) {
+    return { success: false, message: "WebMap item creation completed without returning an item id." };
+  }
+
+  return { success: true, message: "WebMap item created.", itemId };
+}
+
+export async function listUserFolders(params: {
+  portalUrl: string;
+  token: string;
+  username: string;
+}): Promise<UserFolderInfo[]> {
+  const { portalUrl, token, username } = params;
+  const url = `${portalUrl}/sharing/rest/content/users/${encodeURIComponent(username)}?f=json&token=${encodeURIComponent(token)}`;
+  const json = await fetchJson<any>(url);
+
+  if (json?.error) {
+    throw new Error(json?.error?.message || "Failed to load folders.");
+  }
+
+  const folders = Array.isArray(json?.folders) ? json.folders : [];
+  return folders
+    .map((folder: any) => ({
+      id: safeString(folder?.id),
+      title: safeString(folder?.title),
+    }))
+    .filter((folder: UserFolderInfo) => Boolean(folder.id && folder.title));
+}
+
+export async function createUserFolder(params: {
+  portalUrl: string;
+  token: string;
+  username: string;
+  title: string;
+}): Promise<UserFolderInfo> {
+  const { portalUrl, token, username, title } = params;
+  const url = `${portalUrl}/sharing/rest/content/users/${encodeURIComponent(username)}/createFolder`;
+  const body = new URLSearchParams({
+    f: "json",
+    token,
+    title,
+  });
+
+  const json = await fetchJson<any>(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (json?.error) {
+    throw new Error(json?.error?.message || "Failed to create folder.");
+  }
+
+  const folder = json?.folder;
+  const folderId = safeString(folder?.id);
+  const folderTitle = safeString(folder?.title) || title.trim();
+
+  if (!folderId) {
+    throw new Error("Folder creation completed without returning a folder id.");
+  }
+
+  return {
+    id: folderId,
+    title: folderTitle,
+  };
+}
+
+export async function listPortalCategoryOptions(params: {
+  portalUrl: string;
+}): Promise<PortalCategoryOption[]> {
+  const portal = new Portal({
+    url: normalizePortalUrl(params.portalUrl),
+  });
+
+  await portal.load();
+  if (!portal.hasCategorySchema) {
+    return [];
+  }
+
+  const schema = await portal.fetchCategorySchema();
+  const options = Array.isArray(schema)
+    ? schema.flatMap((entry: any) => {
+        const rootTitle = safeString(entry?.title).trim();
+        const categories = Array.isArray(entry?.categories) ? entry.categories : [];
+        if (!rootTitle || !categories.length) {
+          return [];
+        }
+        return flattenCategoryNodes(categories, [rootTitle]);
+      })
+    : [];
+
+  return options.sort((left, right) => left.label.localeCompare(right.label));
+}
+
+export async function listUserTags(params: {
+  portalUrl: string;
+}): Promise<PortalTagInfo[]> {
+  const portal = new Portal({
+    url: normalizePortalUrl(params.portalUrl),
+  });
+
+  await portal.load();
+  if (!portal.user) {
+    return [];
+  }
+
+  const tags = await portal.user.fetchTags();
+  return tags
+    .map((entry) => ({
+      tag: safeString(entry?.tag).trim(),
+      count: typeof entry?.count === "number" ? entry.count : 0,
+    }))
+    .filter((entry) => Boolean(entry.tag))
+    .sort((left, right) => left.tag.localeCompare(right.tag));
+}
+
+export async function updateWebMapItem(
+  params: UpdateWebMapItemParams
+): Promise<PortalItemMutationResult> {
+  const { portalUrl, token, username, itemId, text, title, snippet, description, tags } = params;
+  const url = `${portalUrl}/sharing/rest/content/users/${encodeURIComponent(username)}/items/${encodeURIComponent(itemId)}/update`;
+  const body = new URLSearchParams({
+    f: "json",
+    token,
+    text: JSON.stringify(text),
+  });
+
+  if (title?.trim()) body.set("title", title.trim());
+  if (snippet?.trim()) body.set("snippet", snippet.trim());
+  if (description?.trim()) body.set("description", description.trim());
+  if (tags?.length) body.set("tags", tags.join(","));
+
+  const json = await fetchJson<any>(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (json?.error || json?.success === false) {
+    return { success: false, message: json?.error?.message || "Failed to update WebMap item." };
+  }
+
+  return { success: true, message: "WebMap item updated." };
+}
+
+export async function deletePortalItem(params: {
+  portalUrl: string;
+  token: string;
+  username: string;
+  itemId: string;
+  keepalive?: boolean;
+}): Promise<PortalItemMutationResult> {
+  const { portalUrl, token, username, itemId, keepalive = false } = params;
+  const url = `${portalUrl}/sharing/rest/content/users/${encodeURIComponent(username)}/items/${encodeURIComponent(itemId)}/delete`;
+  const body = new URLSearchParams({
+    f: "json",
+    token,
+  });
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+    keepalive,
+  });
+  const json = await response.json();
+
+  if (!response.ok || json?.error || json?.success === false) {
+    return { success: false, message: json?.error?.message || "Failed to delete portal item." };
+  }
+
+  return { success: true, message: "Portal item deleted." };
 }
 
 export async function generateAndSaveWebMapEmbeddings(params: {
