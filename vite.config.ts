@@ -5,6 +5,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
   const proxyTarget =
     (env.VITE_MCP_PROXY_TARGET || env.VITE_ARCGIS_MCP_PROXY_TARGET || "http://127.0.0.1:8808").replace(/\/+$/, "");
+  const base = env.VITE_BASE_PATH || "/";
 
   const proxyOptions = {
     target: proxyTarget,
@@ -12,6 +13,7 @@ export default defineConfig(({ mode }) => {
   };
 
   return {
+    base,
     plugins: [react()],
     server: {
       proxy: {

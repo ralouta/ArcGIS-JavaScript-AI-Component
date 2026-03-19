@@ -2,6 +2,16 @@
 
 React + Vite demo built with ArcGIS Maps SDK, ArcGIS Assistant, and an MCP hub.
 
+## Disclaimer
+
+Most of this app has been vibe coded with various coding agents. Review the code, configuration, and deployment choices before using it beyond demos or internal experimentation.
+
+## Hosted App
+
+If you just want to use the app in a browser, open:
+
+- [ArcGIS Assistant Demo](https://ralouta.github.io/ArcGIS-JavaScript-AI-Component/)
+
 ## What It Does
 
 - Sign in with ArcGIS and load an existing WebMap or create a new one.
@@ -9,21 +19,37 @@ React + Vite demo built with ArcGIS Maps SDK, ArcGIS Assistant, and an MCP hub.
 - Use MCP-backed tools for external workflows such as weather, catalog, or custom server tasks.
 - Create and manage hosted feature layers from assistant results.
 
-## Requirements
+## Local Development Requirements
 
 - Node.js 18+
 - An ArcGIS OAuth client ID
 - A WebMap item ID to load, or permission to create WebMaps in your ArcGIS org
 
-## Setup
+## Local Setup
 
-### 1. Install
+### 1. Clone The Repository
+
+```bash
+git clone https://github.com/ralouta/ArcGIS-JavaScript-AI-Component.git
+cd ArcGIS-JavaScript-AI-Component
+```
+
+### 2. Install Dependencies
+
+With `npm`:
 
 ```bash
 npm install
 ```
 
-### 2. Environment
+With `npx` only, you can run the app and hub from the repo without relying on npm scripts:
+
+```bash
+npx vite
+npx tsx hub/server.ts
+```
+
+### 3. Configure Environment
 
 Create `.env.local` in the project root:
 
@@ -33,13 +59,15 @@ VITE_ARCGIS_PORTAL_URL=https://www.arcgis.com
 VITE_APP_NAME=ArcGIS Assistant Demo
 ```
 
-### 3. ArcGIS OAuth App
+### 4. Configure ArcGIS OAuth
 
 1. Create an ArcGIS OAuth app.
 2. Add redirect URLs: `http://localhost:5173` and `http://localhost:4173`.
 3. Copy the client ID into `VITE_ARCGIS_OAUTH_APP_ID`.
 
-## Run
+## Local Run Commands
+
+With `npm` scripts:
 
 ```bash
 npm run dev
@@ -47,6 +75,16 @@ npm run hub
 npm run hub:dev
 npm run build
 npm run preview
+```
+
+With `npx` commands:
+
+```bash
+npx vite
+npx tsx hub/server.ts
+npx tsx --watch hub/server.ts
+npx vite build
+npx vite preview
 ```
 
 Run the app and hub in separate terminals when using MCP features.
@@ -114,3 +152,4 @@ Use it when you want the wider assistant panel and the theme editor controls:
 ```text
 http://localhost:5173/?mode=edit
 ```
+
