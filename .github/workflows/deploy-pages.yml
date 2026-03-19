@@ -34,6 +34,9 @@ jobs:
       - name: Build app
         env:
           VITE_BASE_PATH: /ArcGIS-JavaScript-AI-Component/
+          VITE_ARCGIS_OAUTH_APP_ID: ${{ vars.VITE_ARCGIS_OAUTH_APP_ID }}
+          VITE_ARCGIS_PORTAL_URL: ${{ vars.VITE_ARCGIS_PORTAL_URL }}
+          VITE_APP_NAME: ${{ vars.VITE_APP_NAME }}
         run: npm run build
 
       - name: Configure Pages
