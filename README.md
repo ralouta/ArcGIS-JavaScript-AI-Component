@@ -6,10 +6,6 @@ React + Vite app built with ArcGIS Maps SDK, ArcGIS Assistant components, and an
 
 Most of this app has been vibe coded with various coding agents. Review the code, configuration, and deployment choices before using it beyond demos or internal experimentation.
 
-## Hosted App
-
-- [ArcGIS Agent Components Demo](https://ralouta.github.io/ArcGIS-JavaScript-AI-Component/)
-
 ## What It Does
 
 - Sign in with ArcGIS and load an existing WebMap or create a new one.
