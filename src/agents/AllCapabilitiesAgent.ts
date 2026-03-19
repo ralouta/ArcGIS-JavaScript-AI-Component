@@ -6,6 +6,10 @@ type AgentSummary = {
 };
 
 const BUILT_IN_AGENT_SUMMARIES: Record<string, AgentSummary> = {
+  "arcgis-assistant-help-agent": {
+    name: "Help",
+    description: "Answer questions about the current web map, available data, and what kinds of questions the assistant can handle.",
+  },
   "arcgis-assistant-navigation-agent": {
     name: "Navigation",
     description: "Pan, zoom, and navigate to places on the active map.",

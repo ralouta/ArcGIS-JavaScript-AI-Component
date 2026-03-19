@@ -30,6 +30,7 @@ declare namespace JSX {
     "arcgis-basemap-gallery": any;
     // ArcGIS Assistant and agents
     "arcgis-assistant": any;
+    "arcgis-assistant-help-agent": any;
     "arcgis-assistant-navigation-agent": any;
     "arcgis-assistant-data-exploration-agent": any;
     "arcgis-assistant-agent": any;

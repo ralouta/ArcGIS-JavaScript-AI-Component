@@ -547,7 +547,13 @@ export default function App() {
       baseUrl: defaultMcpBaseUrl,
       serverName: "MCP Hub",
     });
-  }, [defaultMcpBaseUrl, effectiveWebMapId, isMapReady, oauthClientId, portalUrl]);
+  }, [
+    defaultMcpBaseUrl,
+    effectiveWebMapId,
+    isMapReady,
+    oauthClientId,
+    portalUrl,
+  ]);
 
   useEffect(() => {
     if (!effectiveWebMapId || !isMapReady) return;
@@ -1159,7 +1165,6 @@ export default function App() {
   const shouldShowHeaderActions = showHeaderActions && isSignedIn;
   const isStartupPage = isSignedIn && !webMapId;
   const shouldRenderAssistant = isMapReady && !mapLoadError;
-  const assistantCanUseMapContext = mapHasOperationalData && isAssistantPrepared && !embeddingsError;
 
   return (
     <calcite-shell
@@ -1371,7 +1376,7 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    {!assistantCanUseMapContext && !mapHasOperationalData && showEmptyMapAssistantNotice && (
+                    {!mapHasOperationalData && showEmptyMapAssistantNotice && (
                       <div className="chat-panel-theme__notice" style={{ marginBottom: "0.9rem" }}>
                         <div>
                           This map is empty, so map navigation and data exploration stay disabled until layers or tables are added. MCP and custom assistant workflows are still available.
@@ -1387,7 +1392,7 @@ export default function App() {
                         </button>
                       </div>
                     )}
-                    {!assistantCanUseMapContext && mapHasOperationalData && (
+                    {mapHasOperationalData && !isAssistantPrepared && !embeddingsError && (
                       <div style={{ padding: "0.25rem 0.9rem 0.9rem", lineHeight: 1.5 }}>
                         <div style={{ fontWeight: 700, marginBottom: "0.35rem" }}>Preparing map-aware assistant tools</div>
                         <div>
@@ -1397,7 +1402,7 @@ export default function App() {
                     )}
                     {shouldRenderAssistant && (
                       <arcgis-assistant
-                        reference-element={assistantCanUseMapContext ? "#main-map" : null}
+                        reference-element="#main-map"
                         heading={chatPanelTitle}
                         class="chat-panel-theme__assistant"
                         style={{
@@ -1412,8 +1417,9 @@ export default function App() {
                           ["--app-chat-panel-border" as any]: chatPanelBorderColor,
                         }}
                       >
-                        {assistantCanUseMapContext && <arcgis-assistant-navigation-agent></arcgis-assistant-navigation-agent>}
-                        {assistantCanUseMapContext && <arcgis-assistant-data-exploration-agent></arcgis-assistant-data-exploration-agent>}
+                        <arcgis-assistant-help-agent></arcgis-assistant-help-agent>
+                        <arcgis-assistant-navigation-agent></arcgis-assistant-navigation-agent>
+                        <arcgis-assistant-data-exploration-agent></arcgis-assistant-data-exploration-agent>
                         {/* Custom agent is appended programmatically via useEffect */}
                       </arcgis-assistant>
                     )}

@@ -25,6 +25,7 @@ import "@arcgis/map-components/components/arcgis-layer-list";
 import "@arcgis/map-components/components/arcgis-basemap-gallery";
 import "@arcgis/ai-components/components/arcgis-assistant";
 import "@arcgis/ai-components/components/arcgis-assistant-agent";
+import "@arcgis/ai-components/components/arcgis-assistant-help-agent";
 import "@arcgis/ai-components/components/arcgis-assistant-navigation-agent";
 import "@arcgis/ai-components/components/arcgis-assistant-data-exploration-agent";
 import App from "./App";
