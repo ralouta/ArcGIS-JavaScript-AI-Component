@@ -30,22 +30,20 @@ cd ArcGIS-JavaScript-AI-Component
 
 ### 2. Install Dependencies
 
-With `npm`:
-
 ```bash
 npm install
 ```
 
-With `npx` only, you can run the app and hub from the repo without relying on npm scripts:
+### 3. Create Local Config Files
 
 ```bash
-npx vite
-npx tsx hub/server.ts
+cp .env.example .env.local
+cp mcp-hub.config.example.json mcp-hub.config.json
 ```
 
-### 3. Configure Environment
+### 4. Configure Environment
 
-Create `.env.local` in the project root:
+Edit `.env.local` in the project root:
 
 ```bash
 VITE_ARCGIS_OAUTH_APP_ID=your-client-id
@@ -53,7 +51,9 @@ VITE_ARCGIS_PORTAL_URL=https://www.arcgis.com
 VITE_APP_NAME=ArcGIS Agent Components Demo
 ```
 
-### 4. Configure ArcGIS OAuth
+Update `mcp-hub.config.json` with the MCP servers you want to use and any local-only API keys.
+
+### 5. Configure ArcGIS OAuth
 
 1. Create an ArcGIS OAuth app.
 2. Add redirect URLs: `http://localhost:5173` and `http://localhost:4173`.
@@ -61,24 +61,12 @@ VITE_APP_NAME=ArcGIS Agent Components Demo
 
 ## Local Run Commands
 
-With `npm` scripts:
-
 ```bash
 npm run dev
 npm run hub
 npm run hub:dev
 npm run build
 npm run preview
-```
-
-With `npx` commands:
-
-```bash
-npx vite
-npx tsx hub/server.ts
-npx tsx --watch hub/server.ts
-npx vite build
-npx vite preview
 ```
 
 Run the app and hub in separate terminals when using MCP features.
