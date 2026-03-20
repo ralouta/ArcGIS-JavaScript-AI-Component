@@ -1,6 +1,10 @@
 import type { CreateHostedFeatureServiceResult } from "../utils/arcgisOnline";
 import { getCredential, createHostedFeatureService } from "../utils/arcgisOnline";
+import { invokeToolPrompt } from "@arcgis/ai-orchestrator";
+import { HumanMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
 import { StateGraph, Annotation as ANNOTATION, START, END } from "@langchain/langgraph/web";
+import { z } from "zod";
 import {
   addFeatureLayerToCurrentMap,
   addPointFeaturesToLayer,
@@ -19,18 +23,7 @@ export interface CreateFeatureLayerAgentContext {
   layerName?: string;
   geometryType?: "esriGeometryPoint" | "esriGeometryPolyline" | "esriGeometryPolygon";
   fields?: Array<{ name: string; type: string; alias?: string; length?: number }>;
-  llm?: {
-    invoke: (input: any) => Promise<any>;
-  };
-  llmSystemPrompt?: string;
 }
-
-type ExtractedIntent = {
-  name?: string | null;
-  geometryType?: "esriGeometryPoint" | "esriGeometryPolyline" | "esriGeometryPolygon" | null;
-  fields?: Array<{ name: string; type: string; alias?: string; length?: number }> | null;
-  useMemory?: boolean;
-};
 
 function normalizeGeometryType(value?: string | null): CreateFeatureLayerAgentContext["geometryType"] | null {
   if (!value) return null;
@@ -53,70 +46,32 @@ function esriFieldTypeFrom(textType: string): string {
   return "esriFieldTypeString";
 }
 
-function parseNameFallback(text: string): string | null {
-  const explicitPatterns = [
-    /\btitle\s+["']([^"']+)["']/i,
-    /\bname\s+["']([^"']+)["']/i,
-    /\bcalled\s+["']([^"']+)["']/i,
-    /\bnamed\s+["']([^"']+)["']/i,
-  ];
-  for (const pattern of explicitPatterns) {
-    const match = text.match(pattern);
-    if (match?.[1]?.trim()) return match[1].trim();
+const extractionTool = tool(
+  async (args) => JSON.stringify(args),
+  {
+    name: "extract_layer_intent",
+    description: "Extract all feature layer creation parameters from the user message.",
+    schema: z.object({
+      name: z.string().nullable().describe(
+        "The title/name for the layer. Look for it after words like 'called', 'named', 'titled', 'with title', 'with name', or as a standalone identifier. Examples: 'called UtrechtParks' → 'UtrechtParks', 'title My Layer' → 'My Layer', 'layer IncidentData' → 'IncidentData'."
+      ),
+      geometryType: z.enum(["point", "polyline", "polygon"]).nullable().describe(
+        "Geometry type. 'point' for point/marker/location layers, 'polyline' for line/route/road layers, 'polygon' for area/zone/region/park layers."
+      ),
+      fields: z.array(
+        z.object({
+          name: z.string().describe("Field name"),
+          type: z.string().describe("Field type as given by the user, e.g. str, int, double, date"),
+        })
+      ).nullable().describe(
+        "Fields specified by the user, e.g. 'fields: park_area:double, tree_count:int' → [{name:'park_area',type:'double'},{name:'tree_count',type:'int'}]"
+      ),
+      useMemory: z.boolean().describe(
+        "True if the user wants to populate the new layer from current/latest assistant results, returned data, or data already in the map."
+      ),
+    }),
   }
-
-  const generic = text.match(/\b(?:create|make|build)\s+(?:a\s+)?(?:hosted\s+)?(?:feature\s+)?(?:layer|service)\s+(?:called|named)?\s*([A-Za-z0-9 _-]{3,80})/i);
-  return generic?.[1]?.trim() || null;
-}
-
-function parseFieldsFallback(text: string): Array<{ name: string; type: string; alias?: string; length?: number }> | null {
-  const match = text.match(/\bfields?\b\s*:?(.*)$/i);
-  if (!match?.[1]?.trim()) return null;
-
-  const tokens = match[1]
-    .replace(/[;]+/g, ",")
-    .split(",")
-    .flatMap((segment) => segment.split(/\s+/))
-    .map((token) => token.trim())
-    .filter(Boolean);
-
-  const fields: Array<{ name: string; type: string; alias?: string; length?: number }> = [];
-  for (const token of tokens) {
-    const colonIdx = token.indexOf(":");
-    const parenIdx = token.indexOf("(");
-    let fieldName = "";
-    let fieldType = "";
-
-    if (colonIdx > 0) {
-      fieldName = token.slice(0, colonIdx).trim();
-      fieldType = token.slice(colonIdx + 1).trim();
-    } else if (parenIdx > 0) {
-      fieldName = token.slice(0, parenIdx).trim();
-      const closeParenIdx = token.indexOf(")", parenIdx);
-      fieldType = closeParenIdx > parenIdx ? token.slice(parenIdx + 1, closeParenIdx).trim() : token.slice(parenIdx + 1).trim();
-    }
-
-    if (!fieldName || !fieldType) continue;
-    const normalizedType = esriFieldTypeFrom(fieldType.replace(/[).;\s]+$/, ""));
-    const field: { name: string; type: string; alias?: string; length?: number } = {
-      name: fieldName,
-      alias: fieldName,
-      type: normalizedType,
-    };
-    if (normalizedType === "esriFieldTypeString") field.length = 255;
-    fields.push(field);
-  }
-
-  return fields.length ? fields : null;
-}
-
-function wantsMemoryFeatures(text: string): boolean {
-  return /\b(?:in memory|from memory|current results|latest results|last results|returned by the agent|returned by the assistant|returned data|current result|latest result|these results|those results|this data|its data|with data|populate it|seed it|loaded data|current map data|data in the map|data on the map|results in the map|results on the map|weather data in the map|use the data in the map|use data from the map|using .* data in the map|using .* data on the map)\b/i.test(text);
-}
-
-function hasFieldsIntent(text: string): boolean {
-  return /\bfields?\b/i.test(text);
-}
+);
 
 function extractLastUserText(state: any): string {
   const rawMessages = Array.isArray(state?.messages) ? state.messages : [];
@@ -131,49 +86,6 @@ function extractLastUserText(state: any): string {
   }
 
   return "";
-}
-
-async function extractWithLLM(text: string, ctx: CreateFeatureLayerAgentContext): Promise<ExtractedIntent | null> {
-  if (!ctx.llm) return null;
-  const systemPrompt = ctx.llmSystemPrompt ||
-    "You are a strict information extraction assistant. Return only valid JSON with schema {\"name\": string|null, \"geometryType\": \"point\"|\"polyline\"|\"polygon\"|null, \"fields\": [{\"name\": string, \"type\": string}]|null, \"useMemory\": boolean}.";
-
-  try {
-    const response = await ctx.llm.invoke({
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: text },
-      ],
-    });
-    const raw = typeof response === "string" ? response : response?.content || response?.text || "";
-    const start = raw.indexOf("{");
-    const end = raw.lastIndexOf("}");
-    if (start < 0 || end <= start) return null;
-    const parsed = JSON.parse(raw.slice(start, end + 1));
-    const fields = Array.isArray(parsed?.fields)
-      ? parsed.fields
-          .filter((field: any) => field?.name && field?.type)
-          .map((field: any) => {
-            const type = esriFieldTypeFrom(String(field.type));
-            const nextField: { name: string; type: string; alias?: string; length?: number } = {
-              name: String(field.name),
-              alias: String(field.name),
-              type,
-            };
-            if (type === "esriFieldTypeString") nextField.length = 255;
-            return nextField;
-          })
-      : null;
-
-    return {
-      name: parsed?.name || null,
-      geometryType: normalizeGeometryType(parsed?.geometryType),
-      fields,
-      useMemory: Boolean(parsed?.useMemory),
-    };
-  } catch {
-    return null;
-  }
 }
 
 export function registerCreateFeatureLayerAgent(
@@ -207,36 +119,68 @@ export function registerCreateFeatureLayerAgent(
 
     async function parseRequestNode(s: any) {
       const text = extractLastUserText(s);
-      const llmExtracted = text ? await extractWithLLM(text, ctx) : null;
-      const desiredName = llmExtracted?.name || parseNameFallback(text) || null;
-      const desiredGeometryType = llmExtracted?.geometryType || normalizeGeometryType(text) || null;
-      const desiredFields = llmExtracted?.fields || parseFieldsFallback(text) || null;
-      const fieldsRequested = hasFieldsIntent(text);
-      const useMemory = llmExtracted?.useMemory || wantsMemoryFeatures(text);
 
-      let message = desiredName ? `Using requested name: ${desiredName}` : "No title/name detected in your prompt.";
+      let extracted: {
+        name: string | null;
+        geometryType: "point" | "polyline" | "polygon" | null;
+        fields: Array<{ name: string; type: string }> | null;
+        useMemory: boolean;
+      } = { name: null, geometryType: null, fields: null, useMemory: false };
+
+      try {
+        const response = await invokeToolPrompt({
+          promptText:
+            "You extract feature layer creation parameters from user messages. " +
+            "Always call extract_layer_intent with the values you find. " +
+            "If a value is not present, use null or false.",
+          messages: [new HumanMessage(text || "create a feature layer")],
+          tools: [extractionTool],
+          temperature: 0,
+        });
+        const toolCalls = Array.isArray((response as any)?.tool_calls) ? (response as any).tool_calls : [];
+        const call = toolCalls.find((tc: any) => tc?.name === "extract_layer_intent");
+        if (call?.args) extracted = call.args;
+      } catch {
+        // proceed with empty extraction — createLayerNode will ask for clarification
+      }
+
+      const desiredName = typeof extracted.name === "string" && extracted.name.trim()
+        ? extracted.name.trim()
+        : null;
+      const desiredGeometryType = normalizeGeometryType(extracted.geometryType) || null;
+      const desiredFields = Array.isArray(extracted.fields) && extracted.fields.length
+        ? extracted.fields
+            .filter((f: any) => f?.name && f?.type)
+            .map((f: any) => {
+              const type = esriFieldTypeFrom(String(f.type));
+              const field: { name: string; type: string; alias?: string; length?: number } = {
+                name: String(f.name),
+                alias: String(f.name),
+                type,
+              };
+              if (type === "esriFieldTypeString") field.length = 255;
+              return field;
+            })
+        : null;
+      const useMemory = Boolean(extracted.useMemory);
+      const fieldsRequested = Boolean(desiredFields?.length);
+
+      let message = desiredName
+        ? `Using requested name: ${desiredName}`
+        : "No title/name detected in your prompt.";
       if (desiredGeometryType) {
         message += `\nGeometry type detected: ${desiredGeometryType.replace("esriGeometry", "")}`;
       } else if (!ctx.geometryType) {
         message += "\nNo geometry type specified. Please reply with point, polyline, or polygon.";
       }
       if (desiredFields?.length) {
-        message += `\nParsed fields: ${desiredFields.map((field) => `${field.name}:${field.type.replace("esriFieldType", "")}`).join(", ")}`;
-      } else if (fieldsRequested) {
-        message += "\nI detected a fields request but could not parse it. Use format like: fields name:str, status:str, count:int";
+        message += `\nParsed fields: ${desiredFields.map((f) => `${f.name}:${f.type.replace("esriFieldType", "")}`).join(", ")}`;
       }
       if (useMemory) {
         message += "\nWill seed the new layer with the latest assistant results currently in memory or loaded on the map.";
       }
 
-      return {
-        desiredName,
-        desiredGeometryType,
-        desiredFields,
-        fieldsRequested,
-        useMemory,
-        outputMessage: message,
-      };
+      return { desiredName, desiredGeometryType, desiredFields, fieldsRequested, useMemory, outputMessage: message };
     }
 
     async function createLayerNode(s: any) {

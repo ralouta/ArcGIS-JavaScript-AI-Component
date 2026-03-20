@@ -537,9 +537,6 @@ export default function App() {
       oauthClientId,
       portalUrl,
       layerName: "Locations",
-      geometryType: "esriGeometryPoint",
-      llmSystemPrompt:
-        "You are a strict information extraction assistant. Extract the requested feature layer details from the user text and return only valid JSON. Schema: {\"name\": string|null, \"geometryType\": \"point\"|\"polyline\"|\"polygon\"|null, \"fields\": [{\"name\": string, \"type\": string}]|null, \"useMemory\": boolean}. Set useMemory=true when the user refers to current results, returned data, loaded data, data in the map, or data on the map. Do not include any extra keys or commentary.",
     });
     registerManageFeatureLayerAgent(assistant);
     registerFeatureLayerCapabilitiesAgent(assistant);
