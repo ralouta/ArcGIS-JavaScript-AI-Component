@@ -843,6 +843,42 @@ export async function generateAndSaveWebMapEmbeddings(params: {
   };
 }
 
+export async function searchPortalLayerByName(name: string): Promise<string | null> {
+  let credential: any;
+  try { credential = await getCredential(); } catch { return null; }
+
+  const { token, portalUrl } = credential;
+  const query = `title:"${name}" type:"Feature Service" owner:${credential.username}`;
+  const params = new URLSearchParams({
+    f: "json",
+    q: query,
+    num: "10",
+    sortField: "modified",
+    sortOrder: "desc",
+    token,
+  });
+
+  try {
+    const resp = await fetch(`${portalUrl}/sharing/rest/search?${params}`);
+    if (!resp.ok) return null;
+    const json: any = await resp.json();
+    const items: any[] = Array.isArray(json?.results) ? json.results : [];
+    // exact title match first, then case-insensitive
+    const search = name.trim().toLowerCase();
+    const exact = items.find((item) => item?.title?.toLowerCase() === search);
+    const item = exact ?? items.find((item) => item?.title?.toLowerCase().includes(search));
+    if (!item) return null;
+    // item.url is the FeatureServer root; append /0 if needed
+    if (item.url) {
+      const base = item.url.replace(/\/+$/, "");
+      return /\/\d+$/.test(base) ? base : `${base}/0`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export async function createHostedFeatureService(
   params: CreateHostedFeatureServiceParams
 ): Promise<CreateHostedFeatureServiceResult> {

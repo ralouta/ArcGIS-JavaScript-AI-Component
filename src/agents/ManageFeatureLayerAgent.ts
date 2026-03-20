@@ -1,4 +1,8 @@
 import { StateGraph, Annotation as ANNOTATION, START, END } from "@langchain/langgraph/web";
+import { invokeToolPrompt } from "@arcgis/ai-orchestrator";
+import { HumanMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
 import {
   addPointFeaturesToLayer,
   buildPointFeatureDraftsFromMemory,
@@ -11,92 +15,110 @@ import {
   getLastAssistantGeoSnapshot,
   getLastCreatedFeatureLayer,
 } from "../utils/assistantState";
+import { searchPortalLayerByName } from "../utils/arcgisOnline";
 
-type EditAction = "add" | "update" | "delete" | null;
+const editIntentTool = tool(
+  async (args) => JSON.stringify(args),
+  {
+    name: "extract_edit_intent",
+    description: "Extract all feature layer edit parameters from the user message.",
+    schema: z.object({
+      action: z.enum(["add", "update", "delete", "sync"]).nullable().describe(
+        "'add' when inserting a new feature/record/point. 'update' when modifying an existing one. 'delete'/'remove' when removing. 'sync' for syncing or upserting memory data. Return null only if completely unclear."
+      ),
+      layerName: z.string().nullable().describe(
+        "Name of the existing hosted feature layer. Look for: 'add to X layer', 'to the X layer', 'in X layer', 'X feature layer'. Example: 'add to Utrecht Parks feature layer' → 'Utrecht Parks'."
+      ),
+      layerUrl: z.string().nullable().describe(
+        "Explicit FeatureServer URL if present (https://...FeatureServer or .../FeatureServer/0). Return null otherwise."
+      ),
+      featureLocation: z.string().nullable().describe(
+        "The real-world place to geocode for the feature's geometry. " +
+        "Signals: 'get its location', 'find its location', 'geocode', or any named place/address that appears as the subject to be located. " +
+        "Examples: 'Utrecht Science park. Get its location' → 'Utrecht Science park'; " +
+        "'add Amsterdam Centraal and get its location' → 'Amsterdam Centraal'; " +
+        "'lat 52.09 lon 5.12' → 'lat 52.09 lon 5.12'. " +
+        "IMPORTANT: distinguish from the LAYER name — the layer name follows 'to the X layer' / 'in X layer', the location is a separate place name. Return null only if truly no place is mentioned."
+      ),
+      featureName: z.string().nullable().describe(
+        "Display name/label for the feature. Look for: 'park name is X', 'name is X', 'called X', 'named X'."
+      ),
+      attributes: z.array(
+        z.object({
+          field: z.string().describe("Field/column name exactly as mentioned"),
+          value: z.union([z.string(), z.number()]).describe("The value to assign"),
+        })
+      ).nullable().describe(
+        "All field-value pairs. Handle varied formats: 'tree_count to be 400' → {field:'tree_count',value:400}, 'park_area 1000 square meters' → {field:'park_area',value:1000}, 'park_name is X' → {field:'park_name',value:'X'}. Strip units like 'square meters' from numeric values."
+      ),
+      targetFeatureName: z.string().nullable().describe(
+        "For update/delete: name of the existing feature to target. Null for adds."
+      ),
+      useMemory: z.boolean().describe(
+        "True if the user refers to latest/current assistant results, memory snapshot, or data already on the map."
+      ),
+    }),
+  }
+);
 
 function extractLastUserText(state: any): string {
   const rawMessages = Array.isArray(state?.messages) ? state.messages : [];
   const messages = rawMessages.length > 0 && Array.isArray(rawMessages[0]) ? rawMessages.flat() : rawMessages;
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (!message) continue;
-    if (typeof message.lc_kwargs?.content === "string") return message.lc_kwargs.content.trim();
-    if (typeof message.kwargs?.content === "string") return message.kwargs.content.trim();
-    if (typeof message.content === "string") return message.content.trim();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg) continue;
+    if (typeof msg.lc_kwargs?.content === "string") return msg.lc_kwargs.content.trim();
+    if (typeof msg.kwargs?.content === "string") return msg.kwargs.content.trim();
+    if (typeof msg.content === "string") return msg.content.trim();
   }
-
   return "";
 }
 
-function detectAction(text: string): EditAction {
-  if (/\b(delete|remove)\b/i.test(text)) return "delete";
-  if (/\b(update|edit|modify)\b/i.test(text)) return "update";
-  if (/\b(add|append|insert|load|sync)\b/i.test(text)) return "add";
-  return null;
-}
-
-function wantsMemoryFeatures(text: string): boolean {
-  return /\b(?:in memory|from memory|current results|latest results|last results|returned by the agent|returned by the assistant|these results|those results|loaded data|current map data|data in the map|data on the map|results in the map|results on the map|use the data in the map|use data from the map|using .* data in the map|using .* data on the map)\b/i.test(text);
-}
-
-function extractServiceUrl(text: string): string | null {
-  const match = text.match(/https?:\/\/\S+\/FeatureServer(?:\/\d+)?/i);
-  return match ? match[0].replace(/[),.]+$/, "") : null;
-}
-
-function extractFeatureName(text: string): string | null {
-  const explicit = text.match(/\b(?:named|called|feature)\s+["']([^"']+)["']/i);
-  if (explicit?.[1]?.trim()) return explicit[1].trim();
-  const fallback = text.match(/\b(?:named|called)\s+([A-Za-z0-9 _-]{2,80})/i);
-  return fallback?.[1]?.trim() || null;
-}
-
-function extractAttributeAssignments(text: string): Record<string, unknown> {
-  const attributes: Record<string, unknown> = {};
-  const regex = /\bset\s+([A-Za-z_][A-Za-z0-9_]*)\s+to\s+([A-Za-z0-9_ .:-]+)/gi;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    const field = match[1].trim();
-    const rawValue = match[2].trim().replace(/[.,;]+$/, "");
-    const numberValue = Number(rawValue);
-    attributes[field] = !isNaN(numberValue) && rawValue !== "" ? numberValue : rawValue;
+function findLayerUrlByName(name: string): string | null {
+  const mapEl = document.querySelector("#main-map") as any;
+  const layers = mapEl?.view?.map?.allLayers;
+  if (!layers) return null;
+  const search = name.trim().toLowerCase();
+  let found: any = null;
+  layers.forEach((layer: any) => {
+    if (!found && layer?.url && layer.title?.toLowerCase() === search) found = layer;
+  });
+  if (!found) {
+    layers.forEach((layer: any) => {
+      if (!found && layer?.url && layer.title?.toLowerCase().includes(search)) found = layer;
+    });
   }
-  return attributes;
+  return found?.url ?? null;
 }
 
-function extractCoordinates(text: string): { latitude: number; longitude: number } | null {
-  const coordPatterns = [
-    /\b(?:lat(?:itude)?\s*[:=]?\s*)(-?\d{1,3}(?:\.\d+)?)\s*[, ]+\s*(?:lon(?:gitude)?\s*[:=]?\s*)(-?\d{1,3}(?:\.\d+)?)/i,
-    /\b(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\b/,
-  ];
-  for (const pattern of coordPatterns) {
-    const match = text.match(pattern);
-    if (!match) continue;
-    const latitude = Number(match[1]);
-    const longitude = Number(match[2]);
-    if (!isNaN(latitude) && !isNaN(longitude) && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180) {
-      return { latitude, longitude };
-    }
+async function geocodeLocation(location: string): Promise<{
+  latitude: number;
+  longitude: number;
+  extent?: { xmin: number; ymin: number; xmax: number; ymax: number };
+} | null> {
+  const params = new URLSearchParams({
+    f: "json",
+    SingleLine: location,
+    maxLocations: "1",
+    outFields: "*",
+    forStorage: "false",
+  });
+  try {
+    const resp = await fetch(`https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?${params}`);
+    if (!resp.ok) return null;
+    const json: any = await resp.json();
+    const candidate = json?.candidates?.[0];
+    const latitude = Number(candidate?.location?.y);
+    const longitude = Number(candidate?.location?.x);
+    if (isNaN(latitude) || isNaN(longitude)) return null;
+    const ext = candidate?.extent;
+    const extent = ext
+      ? { xmin: Number(ext.xmin), ymin: Number(ext.ymin), xmax: Number(ext.xmax), ymax: Number(ext.ymax) }
+      : undefined;
+    return { latitude, longitude, extent };
+  } catch {
+    return null;
   }
-  return null;
-}
-
-function buildManualDraft(text: string): PointFeatureDraft | null {
-  const coordinates = extractCoordinates(text);
-  if (!coordinates) return null;
-  const name = extractFeatureName(text) || `Feature ${coordinates.latitude.toFixed(4)}, ${coordinates.longitude.toFixed(4)}`;
-  const attributes = {
-    Name: name,
-    Category: "point",
-    Origin: "manual",
-    ...extractAttributeAssignments(text),
-  };
-
-  return {
-    geometry: { type: "point", latitude: coordinates.latitude, longitude: coordinates.longitude },
-    attributes,
-  };
 }
 
 export function registerManageFeatureLayerAgent(assistant: HTMLElement) {
@@ -118,72 +140,230 @@ export function registerManageFeatureLayerAgent(assistant: HTMLElement) {
 
     async function performEditNode(s: any) {
       const text = extractLastUserText(s);
-      const action = detectAction(text);
-      const explicitLayerUrl = extractServiceUrl(text);
-      const lastCreatedLayer = getLastCreatedFeatureLayer();
-      const layerUrl = explicitLayerUrl || lastCreatedLayer?.layerUrl || null;
-      const useMemory = wantsMemoryFeatures(text);
 
-      if (!action) {
-        return { outputMessage: "I need an edit action: add, update, or delete." };
+      // ── Extract intent via LLM ──────────────────────────────────────────
+      let intent = {
+        action: null as "add" | "update" | "delete" | "sync" | null,
+        layerName: null as string | null,
+        layerUrl: null as string | null,
+        featureLocation: null as string | null,
+        featureName: null as string | null,
+        attributes: null as Array<{ field: string; value: string | number }> | null,
+        targetFeatureName: null as string | null,
+        useMemory: false,
+      };
+
+      try {
+        const response = await invokeToolPrompt({
+          promptText:
+            "You extract feature layer edit parameters from user messages. " +
+            "Always call extract_edit_intent with everything you can find. " +
+            "For attributes, extract ALL field-value pairs, handling any natural language format.",
+          messages: [new HumanMessage(text || "edit feature layer")],
+          tools: [editIntentTool],
+          temperature: 0,
+        });
+        const call = (Array.isArray((response as any)?.tool_calls) ? (response as any).tool_calls : [])
+          .find((tc: any) => tc?.name === "extract_edit_intent");
+        if (call?.args) intent = { ...intent, ...call.args };
+      } catch {
+        // continue with empty intent
+      }
+
+      // ── Resolve layer URL ───────────────────────────────────────────────
+      const lastCreated = getLastCreatedFeatureLayer();
+      const mapLayerUrl = intent.layerName ? findLayerUrlByName(intent.layerName) : null;
+      const portalLayerUrl = (!mapLayerUrl && intent.layerName)
+        ? await searchPortalLayerByName(intent.layerName)
+        : null;
+      const layerUrl =
+        intent.layerUrl ||
+        mapLayerUrl ||
+        portalLayerUrl ||
+        lastCreated?.layerUrl ||
+        null;
+
+      if (!intent.action) {
+        return { outputMessage: "Please tell me what you'd like to do: add, update, or delete a feature." };
       }
       if (!layerUrl) {
-        return { outputMessage: "No target feature layer was provided and there is no recently created layer in memory. Provide a FeatureServer URL or create a layer first." };
+        const hint = intent.layerName
+          ? `Could not find a layer named "${intent.layerName}" in the current map or in your ArcGIS Online content.`
+          : "No target layer found.";
+        return { outputMessage: `${hint} Provide a FeatureServer URL or load the layer onto the map.` };
       }
 
-      if (action === "add") {
-        if (useMemory) {
+      // ── ADD ─────────────────────────────────────────────────────────────
+      if (intent.action === "add") {
+        if (intent.useMemory) {
           const drafts = await buildPointFeatureDraftsFromMemory(getLastAssistantGeoSnapshot());
-          const result = /\b(sync|upsert|update)\b/i.test(text)
-            ? await upsertPointFeaturesByName(layerUrl, drafts)
-            : await addPointFeaturesToLayer(layerUrl, drafts);
-          return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
-        }
-
-        const manualDraft = buildManualDraft(text);
-        if (!manualDraft) {
-          return { outputMessage: "For manual adds, provide coordinates such as lat 33.8881 lon 35.5040 and optionally a name." };
-        }
-        const result = await addPointFeaturesToLayer(layerUrl, [manualDraft]);
-        return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
-      }
-
-      if (action === "delete") {
-        if (useMemory) {
-          const drafts = await buildPointFeatureDraftsFromMemory(getLastAssistantGeoSnapshot());
-          let deletedCount = 0;
-          const messages: string[] = [];
-          for (const draft of drafts) {
-            const name = String(draft.attributes.Name ?? "").trim();
-            if (!name) continue;
-            const result = await deleteFeaturesByName(layerUrl, name);
-            deletedCount += result.deletedCount ?? 0;
-            if (result.success) messages.push(result.message);
+          try {
+            const result = await addPointFeaturesToLayer(layerUrl, drafts);
+            return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
+          } catch (err: any) {
+            return { outputMessage: `Failed to add features: ${err?.message ?? String(err)}` };
           }
-          return { outputMessage: deletedCount ? `${messages.join("\n")}\nTarget layer: ${layerUrl}` : `No matching memory features were deleted from ${layerUrl}.` };
         }
 
-        const featureName = extractFeatureName(text);
-        if (!featureName) {
-          return { outputMessage: "For deletes, specify the feature name, for example: delete feature named Beirut." };
+        // Resolve geometry via geocoding
+        const geo = intent.featureLocation ? await geocodeLocation(intent.featureLocation) : null;
+
+        if (!geo) {
+          const hint = intent.featureLocation
+            ? `Could not geocode "${intent.featureLocation}".`
+            : "No location was specified.";
+          return { outputMessage: `${hint} Please provide a place name, address, or coordinates.` };
         }
-        const result = await deleteFeaturesByName(layerUrl, featureName);
-        return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
+
+        const featureName = intent.featureName || intent.featureLocation || "New Feature";
+        const attrMap: Record<string, unknown> = { Name: featureName, Category: "point", Origin: "manual" };
+        for (const { field, value } of intent.attributes ?? []) {
+          attrMap[field] = value;
+        }
+
+        // Determine geometry type from the layer and build the right geometry
+        try {
+          const FeatureLayer = (await import("@arcgis/core/layers/FeatureLayer")).default;
+          const Graphic = (await import("@arcgis/core/Graphic")).default;
+          const Polygon = (await import("@arcgis/core/geometry/Polygon")).default;
+          const Point = (await import("@arcgis/core/geometry/Point")).default;
+
+          const normalizedUrl = layerUrl.trim().replace(/\/+$/, "").replace(/\/\d+$/, "") + "/0";
+          const layer = new FeatureLayer({ url: normalizedUrl });
+          await layer.load();
+
+          const sanitizedAttrs: Record<string, unknown> = {};
+          const fieldMap = new Map((layer.fields ?? []).map((f: any) => [f.name.toLowerCase(), f.name]));
+          for (const [k, v] of Object.entries(attrMap)) {
+            const matched = fieldMap.get(k.toLowerCase());
+            if (matched) sanitizedAttrs[matched] = v;
+          }
+
+          let geometry: any;
+          const geoType = layer.geometryType;
+
+          if (geoType === "polygon") {
+            if (geo.extent && !isNaN(geo.extent.xmin)) {
+              geometry = new Polygon({
+                rings: [[
+                  [geo.extent.xmin, geo.extent.ymin],
+                  [geo.extent.xmax, geo.extent.ymin],
+                  [geo.extent.xmax, geo.extent.ymax],
+                  [geo.extent.xmin, geo.extent.ymax],
+                  [geo.extent.xmin, geo.extent.ymin],
+                ]],
+                spatialReference: { wkid: 4326 },
+              });
+            } else {
+              // Fallback: small bounding box around the geocoded point
+              const delta = 0.002;
+              geometry = new Polygon({
+                rings: [[
+                  [geo.longitude - delta, geo.latitude - delta],
+                  [geo.longitude + delta, geo.latitude - delta],
+                  [geo.longitude + delta, geo.latitude + delta],
+                  [geo.longitude - delta, geo.latitude + delta],
+                  [geo.longitude - delta, geo.latitude - delta],
+                ]],
+                spatialReference: { wkid: 4326 },
+              });
+            }
+          } else {
+            geometry = new Point({ latitude: geo.latitude, longitude: geo.longitude });
+          }
+
+          const graphic = new Graphic({ geometry, attributes: sanitizedAttrs });
+          const editResult = await layer.applyEdits({ addFeatures: [graphic] });
+          const added = Array.isArray(editResult.addFeatureResults)
+            ? editResult.addFeatureResults.filter((r: any) => r?.objectId != null && !r?.error).length
+            : 0;
+          const failed = Array.isArray(editResult.addFeatureResults)
+            ? editResult.addFeatureResults.filter((r: any) => r?.error)
+            : [];
+
+          if (added > 0) {
+            return {
+              outputMessage:
+                `Successfully added "${featureName}" to the layer.\n` +
+                `Location: ${geo.latitude.toFixed(5)}, ${geo.longitude.toFixed(5)}\n` +
+                `Fields added: ${Object.keys(sanitizedAttrs).join(", ")}\n` +
+                `Target layer: ${layerUrl}`,
+            };
+          }
+          const errDetail = failed[0]?.error?.message ?? "Unknown error from applyEdits";
+          return { outputMessage: `Feature was not added. Server error: ${errDetail}` };
+        } catch (err: any) {
+          return { outputMessage: `Failed to add feature: ${err?.message ?? String(err)}` };
+        }
       }
 
-      if (useMemory) {
-        const drafts = await buildPointFeatureDraftsFromMemory(getLastAssistantGeoSnapshot());
-        const result = await upsertPointFeaturesByName(layerUrl, drafts);
-        return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
+      // ── SYNC ────────────────────────────────────────────────────────────
+      if (intent.action === "sync") {
+        try {
+          const drafts = await buildPointFeatureDraftsFromMemory(getLastAssistantGeoSnapshot());
+          const result = await upsertPointFeaturesByName(layerUrl, drafts);
+          return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
+        } catch (err: any) {
+          return { outputMessage: `Sync failed: ${err?.message ?? String(err)}` };
+        }
       }
 
-      const featureName = extractFeatureName(text);
-      const attributes = extractAttributeAssignments(text);
-      if (!featureName || !Object.keys(attributes).length) {
-        return { outputMessage: "For updates, specify the feature name and at least one field assignment, for example: update feature named Beirut set Status to Active." };
+      // ── DELETE ──────────────────────────────────────────────────────────
+      if (intent.action === "delete") {
+        if (intent.useMemory) {
+          try {
+            const drafts = await buildPointFeatureDraftsFromMemory(getLastAssistantGeoSnapshot());
+            let deletedCount = 0;
+            const messages: string[] = [];
+            for (const draft of drafts) {
+              const name = String(draft.attributes.Name ?? "").trim();
+              if (!name) continue;
+              const result = await deleteFeaturesByName(layerUrl, name);
+              deletedCount += result.deletedCount ?? 0;
+              if (result.success) messages.push(result.message);
+            }
+            return { outputMessage: deletedCount ? `${messages.join("\n")}\nTarget layer: ${layerUrl}` : `No matching memory features were deleted from ${layerUrl}.` };
+          } catch (err: any) {
+            return { outputMessage: `Delete failed: ${err?.message ?? String(err)}` };
+          }
+        }
+        const targetName = intent.targetFeatureName;
+        if (!targetName) {
+          return { outputMessage: "Specify the name of the feature to delete." };
+        }
+        try {
+          const result = await deleteFeaturesByName(layerUrl, targetName);
+          return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
+        } catch (err: any) {
+          return { outputMessage: `Delete failed: ${err?.message ?? String(err)}` };
+        }
       }
-      const result = await updateFeaturesByName(layerUrl, featureName, attributes);
-      return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
+
+      // ── UPDATE ──────────────────────────────────────────────────────────
+      if (intent.useMemory) {
+        try {
+          const drafts = await buildPointFeatureDraftsFromMemory(getLastAssistantGeoSnapshot());
+          const result = await upsertPointFeaturesByName(layerUrl, drafts);
+          return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
+        } catch (err: any) {
+          return { outputMessage: `Update failed: ${err?.message ?? String(err)}` };
+        }
+      }
+
+      const targetName = intent.targetFeatureName;
+      const attrMap: Record<string, unknown> = {};
+      for (const { field, value } of intent.attributes ?? []) {
+        attrMap[field] = value;
+      }
+      if (!targetName || !Object.keys(attrMap).length) {
+        return { outputMessage: "For updates, specify the feature name and at least one field to change." };
+      }
+      try {
+        const result = await updateFeaturesByName(layerUrl, targetName, attrMap);
+        return { outputMessage: `${result.message}\nTarget layer: ${layerUrl}` };
+      } catch (err: any) {
+        return { outputMessage: `Update failed: ${err?.message ?? String(err)}` };
+      }
     }
 
     return new StateGraph(state)
@@ -196,7 +376,7 @@ export function registerManageFeatureLayerAgent(assistant: HTMLElement) {
     id: agentId,
     name: "Manage Feature Layer Features",
     description:
-      "Adds, updates, deletes, or syncs features in a hosted feature layer. It can operate on the latest created layer automatically and can use the latest assistant results currently in memory.",
+      "Adds, updates, or deletes individual features (records/points) in an existing hosted feature layer. Use when the user wants to add a new record or point to a layer, update field values of an existing feature, or delete a feature. Identifies the target layer by name from the map, by URL, or from the most recently created layer. Can geocode place names and addresses — exact coordinates are not required.",
     createGraph,
     workspace: {},
   } as any;

@@ -52,8 +52,11 @@ const extractionTool = tool(
     name: "extract_layer_intent",
     description: "Extract all feature layer creation parameters from the user message.",
     schema: z.object({
+      isNewLayerRequest: z.boolean().describe(
+        "True ONLY when the user explicitly wants to CREATE or MAKE a brand-new layer/service from scratch. False if the user wants to ADD features/records/points TO an existing layer (e.g. 'add to X layer', 'insert into X', 'add Utrecht Science Park to X')."
+      ),
       name: z.string().nullable().describe(
-        "The title/name for the layer. Look for it after words like 'called', 'named', 'titled', 'with title', 'with name', or as a standalone identifier. Examples: 'called UtrechtParks' → 'UtrechtParks', 'title My Layer' → 'My Layer', 'layer IncidentData' → 'IncidentData'."
+        "The title/name for the NEW layer. Look for it after words like 'called', 'named', 'titled', 'with title', 'with name', or as a standalone identifier. Examples: 'called UtrechtParks' → 'UtrechtParks', 'title My Layer' → 'My Layer', 'layer IncidentData' → 'IncidentData'."
       ),
       geometryType: z.enum(["point", "polyline", "polygon"]).nullable().describe(
         "Geometry type. 'point' for point/marker/location layers, 'polyline' for line/route/road layers, 'polygon' for area/zone/region/park layers."
@@ -121,16 +124,18 @@ export function registerCreateFeatureLayerAgent(
       const text = extractLastUserText(s);
 
       let extracted: {
+        isNewLayerRequest: boolean;
         name: string | null;
         geometryType: "point" | "polyline" | "polygon" | null;
         fields: Array<{ name: string; type: string }> | null;
         useMemory: boolean;
-      } = { name: null, geometryType: null, fields: null, useMemory: false };
+      } = { isNewLayerRequest: true, name: null, geometryType: null, fields: null, useMemory: false };
 
       try {
         const response = await invokeToolPrompt({
           promptText:
-            "You extract feature layer creation parameters from user messages. " +
+            "You extract feature layer CREATION parameters from user messages. " +
+            "Set isNewLayerRequest=false if the user is adding features/records to an EXISTING layer. " +
             "Always call extract_layer_intent with the values you find. " +
             "If a value is not present, use null or false.",
           messages: [new HumanMessage(text || "create a feature layer")],
@@ -139,9 +144,17 @@ export function registerCreateFeatureLayerAgent(
         });
         const toolCalls = Array.isArray((response as any)?.tool_calls) ? (response as any).tool_calls : [];
         const call = toolCalls.find((tc: any) => tc?.name === "extract_layer_intent");
-        if (call?.args) extracted = call.args;
+        if (call?.args) extracted = { ...extracted, ...call.args };
       } catch {
         // proceed with empty extraction — createLayerNode will ask for clarification
+      }
+
+      if (extracted.isNewLayerRequest === false) {
+        return {
+          desiredName: null, desiredGeometryType: null, desiredFields: null,
+          fieldsRequested: false, useMemory: false,
+          outputMessage: "This looks like a request to add to an existing layer. Please use the Manage Feature Layer agent.",
+        };
       }
 
       const desiredName = typeof extracted.name === "string" && extracted.name.trim()
@@ -266,7 +279,7 @@ export function registerCreateFeatureLayerAgent(
       .addNode("createLayerNode", createLayerNode)
       .addNode("replyNode", replyNode)
       .addEdge(START, "parseRequestNode")
-      .addEdge("parseRequestNode", "createLayerNode")
+      .addConditionalEdges("parseRequestNode", (s: any) => s.desiredName === null && /existing layer/i.test(s.outputMessage ?? "") ? "replyNode" : "createLayerNode")
       .addEdge("createLayerNode", "replyNode")
       .addEdge("replyNode", END);
   };
@@ -275,7 +288,7 @@ export function registerCreateFeatureLayerAgent(
     id: agentId,
     name: "Create Feature Layer",
     description:
-      "Creates a hosted feature layer/service in ArcGIS Online. It can create an empty schema or seed a new point layer from the latest assistant results currently in memory.",
+      "Creates a brand-new hosted feature layer/service in ArcGIS Online from scratch. Use ONLY when the user explicitly wants to create a new layer. Do NOT use to add features or records to an existing layer — use the Manage Feature Layer agent for that.",
     createGraph,
     workspace: {},
   } as any;

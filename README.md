@@ -85,11 +85,26 @@ Demo WebMap ID:
 
 Example prompts:
 
+**Map & navigation**
 - `what layers are in this webmap?`
 - `navigate me to baalbek`
-- `get the weather forecast for Beirut`
-- `create a point layer named Sites with fields: Name:string, Category:string`
-- `add the latest results to the last created feature layer`
+- `zoom to the extent of the Streets layer`
+
+**Create Feature Layer**
+- `create a point layer named Sites with fields: Name:string, Category:string, Status:string`
+- `create a polygon layer called Flood Zones with a Description field`
+- `make a new polyline layer named Roads with fields: Road_Name:string, Speed_Limit:integer`
+
+**Manage Feature Layer (add / update / delete features)**
+- `add a point at the Eiffel Tower to the Sites layer`
+- `add a feature to the last created layer at Central Park, New York`
+- `delete all features named "Test" from the Sites layer`
+- `update the feature named "HQ" in the Sites layer — set Status to Active`
+
+**Add Layer to Map**
+- `add the Utrecht Parks layer to the map`
+- `load the layer with item id 3e2f1ab4c8d94567890abcdef1234567`
+- `add this layer to the map: https://services.arcgis.com/your-org/arcgis/rest/services/MyService/FeatureServer/0`
 
 ## MCP Hub
 

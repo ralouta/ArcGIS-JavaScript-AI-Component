@@ -9,6 +9,7 @@ import { registerMcpPassthroughAgent } from "./agents/McpPassthroughAgent";
 import { registerCreateFeatureLayerAgent } from "./agents/CreateFeatureLayerAgent";
 import { registerManageFeatureLayerAgent } from "./agents/ManageFeatureLayerAgent";
 import { registerFeatureLayerCapabilitiesAgent } from "./agents/AllCapabilitiesAgent";
+import { registerAddLayerToMapAgent } from "./agents/AddLayerToMapAgent";
 import { resolveArcgisMcpBaseUrl } from "./utils/arcgisMcp";
 import HubServerManager from "./components/HubServerManager";
 import {
@@ -524,8 +525,29 @@ export default function App() {
   const mapElementRef = useRef<any>(null);
   const startupWebMapInputRef = useRef<any>(null);
   const changeMapDialogInputRef = useRef<any>(null);
+  const layersExpandRef = useRef<any>(null);
+  const basemapExpandRef = useRef<any>(null);
+  const legendExpandRef = useRef<any>(null);
   const categoryTree = buildCategoryTree(newMapCategoryOptions);
   const effectiveWebMapId = webMapId;
+
+  useEffect(() => {
+    const expandEls = [layersExpandRef.current, basemapExpandRef.current, legendExpandRef.current];
+    const cleanups: (() => void)[] = [];
+    expandEls.forEach((el, i) => {
+      if (!el) return;
+      const others = expandEls.filter((_, j) => j !== i);
+      const handler = (event: Event) => {
+        const e = event as CustomEvent<{ name: string }>;
+        if (e.detail?.name === "expanded" && el.expanded) {
+          others.forEach((other) => { if (other) other.expanded = false; });
+        }
+      };
+      el.addEventListener("arcgisPropertyChange", handler);
+      cleanups.push(() => el.removeEventListener("arcgisPropertyChange", handler));
+    });
+    return () => cleanups.forEach((fn) => fn());
+  }, [effectiveWebMapId]);
 
   useEffect(() => {
     if (!effectiveWebMapId || !isMapReady) return;
@@ -539,6 +561,7 @@ export default function App() {
       layerName: "Locations",
     });
     registerManageFeatureLayerAgent(assistant);
+    registerAddLayerToMapAgent(assistant);
     registerFeatureLayerCapabilitiesAgent(assistant);
     registerMcpPassthroughAgent(assistant, {
       baseUrl: defaultMcpBaseUrl,
@@ -1337,13 +1360,13 @@ export default function App() {
           >
             <arcgis-zoom slot="top-left" />
             <arcgis-home slot="top-left" />
-            <arcgis-expand slot="top-left" expand-icon="layers" collapse-icon="x">
+            <arcgis-expand ref={layersExpandRef} slot="top-left" expand-icon="layers" collapse-icon="x">
               <arcgis-layer-list />
             </arcgis-expand>
-            <arcgis-expand slot="top-left" expand-icon="basemap" collapse-icon="x">
+            <arcgis-expand ref={basemapExpandRef} slot="top-left" expand-icon="basemap" collapse-icon="x">
               <arcgis-basemap-gallery />
             </arcgis-expand>
-            <arcgis-expand slot="bottom-left" expand-icon="legend" collapse-icon="x">
+            <arcgis-expand ref={legendExpandRef} slot="bottom-left" expand-icon="legend" collapse-icon="x">
               <arcgis-legend />
             </arcgis-expand>
           </arcgis-map>
