@@ -813,7 +813,7 @@ export default function HubServerManager({ open, onClose }: Props) {
                 }}
                 value={importText}
                 onChange={(e) => setImportText(e.target.value)}
-                placeholder='{"mcpServers":{"weather":{"command":"npx","args":["-y","@dangahagan/weather-mcp@latest"]}}}'
+                placeholder='{"mcpServers":{"my-server":{"command":"npx","args":["-y","my-mcp-package@latest"]}}}'
               />
               {importError && (
                 <div style={{ color: "#d83020", fontSize: "0.82rem" }}>

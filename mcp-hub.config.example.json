@@ -7,47 +7,5 @@
     "mcp-hub.config.json is gitignored and will never be committed."
   ],
   "port": 8808,
-  "servers": [
-    {
-      "id": "example-remote-sse",
-      "label": "my-remote-mcp-server",
-      "transport": "sse",
-      "url": "https://your-mcp-server.example.com/mcp",
-      "env": {},
-      "enabled": false
-    },
-    {
-      "id": "example-stdio-node",
-      "label": "my-local-node-server",
-      "transport": "stdio",
-      "command": "node",
-      "args": ["/absolute/path/to/your/mcp-server/build/index.js"],
-      "env": {
-        "MY_API_KEY": "<your-api-key-here>"
-      },
-      "enabled": false
-    },
-    {
-      "id": "example-stdio-npx",
-      "label": "my-npx-server",
-      "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "some-mcp-package@latest"],
-      "env": {},
-      "enabled": false
-    },
-    {
-      "id": "example-weather",
-      "label": "weather",
-      "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "@dangahagan/weather-mcp@latest"],
-      "env": {
-        "ENABLED_TOOLS": "full",
-        "CACHE_MAX_SIZE": "2000",
-        "LOG_LEVEL": "1"
-      },
-      "enabled": false
-    }
-  ]
+  "servers": []
 }
