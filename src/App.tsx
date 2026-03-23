@@ -5,7 +5,7 @@ import PortalFolder from "@arcgis/core/portal/PortalFolder";
 import Portal from "@arcgis/core/portal/Portal";
 import WebMap from "@arcgis/core/WebMap";
 import mcpServerIcon from "../mcpicon.png";
-import { registerMcpPassthroughAgent } from "./agents/McpPassthroughAgent";
+import { registerMcpPassthroughAgent, refreshMcpAgentDescription } from "./agents/McpPassthroughAgent";
 import { registerCreateFeatureLayerAgent } from "./agents/CreateFeatureLayerAgent";
 import { registerManageFeatureLayerAgent } from "./agents/ManageFeatureLayerAgent";
 import { registerFeatureLayerCapabilitiesAgent } from "./agents/AllCapabilitiesAgent";
@@ -417,6 +417,16 @@ function installAssistantUserBubbleStyler(assistant: HTMLElement): () => void {
   });
   const observedRoots = new WeakSet<Node>();
 
+  function handleAssistantLinkClick(event: Event): void {
+    const composedPath = typeof event.composedPath === "function" ? event.composedPath() : [];
+    const anchor = composedPath.find(
+      (node): node is HTMLAnchorElement => node instanceof HTMLAnchorElement,
+    );
+    if (!anchor?.href) return;
+    event.preventDefault();
+    window.open(anchor.href, "_blank", "noopener,noreferrer");
+  }
+
   function observeRoot(root: Element | ShadowRoot): void {
     if (observedRoots.has(root)) {
       return;
@@ -424,6 +434,7 @@ function installAssistantUserBubbleStyler(assistant: HTMLElement): () => void {
 
     observedRoots.add(root);
     observer.observe(root, { childList: true, subtree: true });
+    root.addEventListener("click", handleAssistantLinkClick, true);
 
     root.querySelectorAll("*").forEach((node) => {
       const shadowRoot = (node as HTMLElement).shadowRoot;
@@ -437,6 +448,12 @@ function installAssistantUserBubbleStyler(assistant: HTMLElement): () => void {
     if (root instanceof Element && root.matches("arcgis-assistant")) {
       ensureAssistantThemeStyle(root);
     }
+
+    root.querySelectorAll("a[href]").forEach((node) => {
+      if (!(node instanceof HTMLAnchorElement)) return;
+      node.target = "_blank";
+      node.rel = "noopener noreferrer";
+    });
 
     root.querySelectorAll("arcgis-assistant-chat-card").forEach((card) => {
       ensureAssistantThemeStyle(card);
@@ -462,7 +479,46 @@ function installAssistantUserBubbleStyler(assistant: HTMLElement): () => void {
 
   return () => {
     observer.disconnect();
+    if (assistant) {
+      assistant.removeEventListener("click", handleAssistantLinkClick, true);
+    }
+    if (assistant.shadowRoot) {
+      assistant.shadowRoot.removeEventListener("click", handleAssistantLinkClick, true);
+    }
   };
+}
+
+function cloneNavigationTarget(target: any): any {
+  if (!target) return null;
+  return typeof target.clone === "function" ? target.clone() : target;
+}
+
+function resolveSavedWebMapNavigationTarget(map: any): any {
+  const initialViewProperties = map?.initialViewProperties;
+  const initialViewpoint = cloneNavigationTarget(initialViewProperties?.viewpoint);
+  if (initialViewpoint) {
+    return initialViewpoint;
+  }
+
+  const targetGeometry = cloneNavigationTarget(initialViewProperties?.targetGeometry);
+  if (targetGeometry) {
+    return targetGeometry;
+  }
+
+  const portalItemExtent = cloneNavigationTarget(map?.portalItem?.extent);
+  if (portalItemExtent) {
+    return portalItemExtent;
+  }
+
+  return cloneNavigationTarget(map?.initialExtent) ?? null;
+}
+
+function getLoadedWebMapItemId(mapElement: any): string {
+  return String(
+    mapElement?.map?.portalItem?.id ??
+    mapElement?.view?.map?.portalItem?.id ??
+    "",
+  ).trim();
 }
 
 export default function App() {
@@ -523,6 +579,7 @@ export default function App() {
   const autoCheckedMapIdRef = useRef<string | null>(null);
   const themeEditorSnapshotRef = useRef<ThemeEditorSnapshot | null>(null);
   const mapElementRef = useRef<any>(null);
+  const homeElementRef = useRef<any>(null);
   const startupWebMapInputRef = useRef<any>(null);
   const changeMapDialogInputRef = useRef<any>(null);
   const layersExpandRef = useRef<any>(null);
@@ -604,9 +661,18 @@ export default function App() {
     const mapElement = mapElementRef.current;
     if (!mapElement || !effectiveWebMapId) return;
 
-    mapElement.itemId = effectiveWebMapId;
+    let cancelled = false;
+    const requestedMap = new WebMap({
+      portalItem: { id: effectiveWebMapId } as any,
+    });
+
+    mapElement.map = requestedMap;
 
     const handleViewReady = () => {
+      const loadedItemId = getLoadedWebMapItemId(mapElement);
+      if (!loadedItemId || loadedItemId !== effectiveWebMapId || cancelled) {
+        return;
+      }
       setIsMapReady(true);
       setMapLoadError(null);
     };
@@ -625,11 +691,21 @@ export default function App() {
     mapElement.addEventListener("arcgisViewReadyError", handleViewReadyError);
     mapElement.addEventListener("arcgisLoadError", handleLoadError);
 
-    if (mapElement.ready || mapElement.view) {
-      handleViewReady();
-    }
+    const waitForRequestedWebMap = async () => {
+      for (let attempt = 0; attempt < 120 && !cancelled; attempt += 1) {
+        const loadedItemId = getLoadedWebMapItemId(mapElement);
+        if (loadedItemId === effectiveWebMapId && (mapElement.ready || mapElement.view)) {
+          handleViewReady();
+          return;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 100));
+      }
+    };
+
+    void waitForRequestedWebMap();
 
     return () => {
+      cancelled = true;
       mapElement.removeEventListener("arcgisViewReadyChange", handleViewReady);
       mapElement.removeEventListener("arcgisViewReadyError", handleViewReadyError);
       mapElement.removeEventListener("arcgisLoadError", handleLoadError);
@@ -658,6 +734,49 @@ export default function App() {
     return () => {
       layerHandle?.remove?.();
       tableHandle?.remove?.();
+    };
+  }, [effectiveWebMapId, isMapReady]);
+
+  useEffect(() => {
+    const mapElement = mapElementRef.current;
+    const homeElement = homeElementRef.current;
+    const view = mapElement?.view;
+    if (!mapElement || !homeElement || !effectiveWebMapId || !isMapReady || !view) return;
+
+    let cancelled = false;
+
+    const syncSavedWebMapView = async () => {
+      const map = view.map;
+
+      try {
+        await view.when();
+        if (typeof map?.load === "function") {
+          await map.load();
+        }
+
+        const savedTarget = resolveSavedWebMapNavigationTarget(map);
+        if (savedTarget) {
+          await view.goTo(savedTarget, { animate: false });
+        }
+      } catch {
+        // Ignore readiness/navigation noise and still try to capture the settled view.
+      }
+
+      if (cancelled) return;
+
+      const currentViewpoint = typeof view.viewpoint?.clone === "function"
+        ? view.viewpoint.clone()
+        : view.viewpoint;
+
+      if (currentViewpoint) {
+        homeElement.viewpoint = currentViewpoint;
+      }
+    };
+
+    void syncSavedWebMapView();
+
+    return () => {
+      cancelled = true;
     };
   }, [effectiveWebMapId, isMapReady]);
 
@@ -1355,11 +1474,12 @@ export default function App() {
       ) : (
         <>
           <arcgis-map
+            key={effectiveWebMapId || "empty-webmap"}
             ref={mapElementRef}
             id="main-map"
           >
             <arcgis-zoom slot="top-left" />
-            <arcgis-home slot="top-left" />
+            <arcgis-home ref={homeElementRef} slot="top-left" />
             <arcgis-expand ref={layersExpandRef} slot="top-left" expand-icon="layers" collapse-icon="x">
               <arcgis-layer-list />
             </arcgis-expand>
@@ -1810,7 +1930,14 @@ export default function App() {
         </calcite-dialog>
       )}
 
-      <HubServerManager open={showHubManager} onClose={useCallback(() => setShowHubManager(false), [])} />
+      <HubServerManager
+        open={showHubManager}
+        onClose={useCallback(() => setShowHubManager(false), [])}
+        onServersChange={useCallback((_servers: unknown[]) => {
+          const assistant = document.querySelector("arcgis-assistant") as HTMLElement | null;
+          if (assistant) void refreshMcpAgentDescription(assistant);
+        }, [])}
+      />
 
       {showChangeMapDialog && (
         <calcite-dialog

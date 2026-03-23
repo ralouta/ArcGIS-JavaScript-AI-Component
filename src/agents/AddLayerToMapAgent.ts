@@ -3,7 +3,7 @@ import { invokeToolPrompt } from "@arcgis/ai-orchestrator";
 import { HumanMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
-import { addFeatureLayerToCurrentMap } from "../utils/featureLayerEdits";
+import { addLayerToCurrentMap, type AddableLayerKind } from "../utils/featureLayerEdits";
 import { getCredential, searchPortalLayerByName } from "../utils/arcgisOnline";
 import esriConfig from "@arcgis/core/config";
 
@@ -48,15 +48,35 @@ function normalizeServiceUrl(url: string): string {
   return /\/\d+$/.test(trimmed) ? trimmed : `${trimmed}/0`;
 }
 
+function isSupportedFeatureLayerUrl(url: string): boolean {
+  return /\/(?:featureserver)(?:\/\d+)?$/i.test(url.trim().replace(/\?.*$/, "").replace(/\/+$/, ""));
+}
+
 async function resolveLayerUrl(
   title: string | null,
   itemId: string | null,
   serviceUrl: string | null,
-): Promise<{ url: string; resolvedTitle: string | null } | { error: string }> {
+): Promise<{ url: string; resolvedTitle: string | null; kind: AddableLayerKind } | { error: string }> {
+
+  const inferKindFromUrl = (url: string): AddableLayerKind => {
+    const normalized = url.trim().replace(/\/+$/, "").toLowerCase();
+    if (/\.(tif|tiff)(\?|$)/i.test(normalized)) return "geotiff";
+    if (/\/imageserver$/i.test(normalized)) return "imagery";
+    if (/\/(mapserver)(\/\d+)?$/i.test(normalized)) return "map-image";
+    return "feature";
+  };
 
   // 1. Direct service URL
   if (serviceUrl) {
-    return { url: normalizeServiceUrl(serviceUrl), resolvedTitle: title };
+    const kind = inferKindFromUrl(serviceUrl);
+    if (kind === "feature" && !isSupportedFeatureLayerUrl(serviceUrl)) {
+      return {
+        error:
+          "That URL is not an ArcGIS FeatureServer layer URL. This app can add FeatureServer, ImageServer, MapServer, and GeoTIFF-backed imagery URLs, but not generic statistical or non-ArcGIS REST endpoints.",
+      };
+    }
+    const url = kind === "feature" ? normalizeServiceUrl(serviceUrl) : serviceUrl.trim().replace(/\/+$/, "");
+    return { url, resolvedTitle: title, kind };
   }
 
   // 2. Item ID → look up item metadata then derive service URL
@@ -72,8 +92,26 @@ async function resolveLayerUrl(
       if (json?.error) return { error: `Portal error: ${json.error.message ?? JSON.stringify(json.error)}` };
       const itemUrl: string | null = json?.url ?? null;
       const itemTitle: string | null = json?.title ?? title;
-      if (!itemUrl) return { error: `Item ${itemId} was found but has no service URL. Is it a Feature Service?` };
-      return { url: normalizeServiceUrl(itemUrl), resolvedTitle: itemTitle };
+      const itemType = String(json?.type ?? "").toLowerCase();
+      if (!itemUrl) return { error: `Item ${itemId} was found but has no service URL. Supported layer items need a URL.` };
+      const kind: AddableLayerKind = itemType.includes("geotiff")
+        ? "geotiff"
+        : itemType.includes("imagery") || /\/imageserver$/i.test(itemUrl)
+          ? "imagery"
+          : itemType.includes("map service") || /\/(mapserver)(\/\d+)?$/i.test(itemUrl)
+            ? "map-image"
+            : "feature";
+      if (kind === "feature" && !isSupportedFeatureLayerUrl(itemUrl)) {
+        return {
+          error:
+            `Item ${itemId} resolved to a non-ArcGIS feature endpoint and cannot be loaded as a FeatureLayer: ${itemUrl}`,
+        };
+      }
+      return {
+        url: kind === "feature" ? normalizeServiceUrl(itemUrl) : itemUrl.trim().replace(/\/+$/, ""),
+        resolvedTitle: itemTitle,
+        kind,
+      };
     } catch (err: any) {
       return { error: `Failed to look up item ${itemId}: ${err?.message ?? String(err)}` };
     }
@@ -82,8 +120,8 @@ async function resolveLayerUrl(
   // 3. Title search in ArcGIS Online
   if (title) {
     const found = await searchPortalLayerByName(title);
-    if (found) return { url: found, resolvedTitle: title };
-    return { error: `No Feature Service named "${title}" was found in your ArcGIS Online content. Try a different title or provide the item ID or service URL directly.` };
+    if (found) return { url: found, resolvedTitle: title, kind: "feature" };
+    return { error: `No supported ArcGIS Feature Service named "${title}" was found in your ArcGIS Online content. Try a different title or provide a valid FeatureServer, ImageServer, MapServer, or GeoTIFF URL directly.` };
   }
 
   return { error: "Please provide a layer title, item ID, or service URL." };
@@ -142,7 +180,11 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
 
       // ── Add to map ──────────────────────────────────────────────────────
       try {
-        await addFeatureLayerToCurrentMap(resolved.url, resolved.resolvedTitle ?? undefined);
+        await addLayerToCurrentMap({
+          url: resolved.url,
+          title: resolved.resolvedTitle ?? undefined,
+          kind: resolved.kind,
+        });
         const displayName = resolved.resolvedTitle ?? resolved.url;
         return {
           outputMessage:

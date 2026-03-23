@@ -350,10 +350,14 @@ function statusColor(status: string): string {
 interface Props {
   open: boolean;
   onClose: () => void;
+  /** Called whenever the server list changes (add/remove/start/stop). */
+  onServersChange?: (servers: HubServer[]) => void;
 }
 
-export default function HubServerManager({ open, onClose }: Props) {
+export default function HubServerManager({ open, onClose, onServersChange }: Props) {
   const [servers, setServers] = useState<HubServer[]>([]);
+  const onServersChangeRef = useRef(onServersChange);
+  onServersChangeRef.current = onServersChange;
   const [loading, setLoading] = useState(false);
   const [hubError, setHubError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -385,11 +389,16 @@ export default function HubServerManager({ open, onClose }: Props) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const applyServers = useCallback((next: HubServer[]) => {
+    setServers(next);
+    onServersChangeRef.current?.(next);
+  }, []);
+
   const load = useCallback(async () => {
     setLoading(true);
     setHubError(null);
     try {
-      setServers(await fetchServers());
+      applyServers(await fetchServers());
     } catch (err: any) {
       setHubError(
         err?.message ?? "Cannot reach MCP Hub. Is it running?",
@@ -397,7 +406,7 @@ export default function HubServerManager({ open, onClose }: Props) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyServers]);
 
   useEffect(() => {
     if (open) {
@@ -415,8 +424,8 @@ export default function HubServerManager({ open, onClose }: Props) {
       const updated = server.enabled
         ? await apiStopServer(server.id)
         : await apiStartServer(server.id);
-      setServers((prev) =>
-        prev.map((s) => (s.id === updated.id ? updated : s)),
+      applyServers(
+        servers.map((s) => (s.id === updated.id ? updated : s)),
       );
     } catch {}
     setBusy(false);
@@ -426,7 +435,7 @@ export default function HubServerManager({ open, onClose }: Props) {
     setBusy(true);
     try {
       await apiDeleteServer(id);
-      setServers((prev) => prev.filter((s) => s.id !== id));
+      applyServers(servers.filter((s) => s.id !== id));
     } catch {}
     setBusy(false);
   };
@@ -454,16 +463,14 @@ export default function HubServerManager({ open, onClose }: Props) {
     try {
       if (addingNew) {
         const created = await apiAddServer(draftToPayload(draft, true));
-        setServers((prev) => [...prev, created]);
+        applyServers([...servers, created]);
       } else if (editingId) {
         const server = servers.find((s) => s.id === editingId);
         const updated = await apiUpdateServer(
           editingId,
           draftToPayload(draft, server?.enabled ?? true),
         );
-        setServers((prev) =>
-          prev.map((s) => (s.id === updated.id ? updated : s)),
-        );
+        applyServers(servers.map((s) => (s.id === updated.id ? updated : s)));
       }
       cancelEdit();
     } catch {}

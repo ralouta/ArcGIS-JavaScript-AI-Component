@@ -3,11 +3,12 @@ import GroupLayer from "@arcgis/core/layers/GroupLayer";
 import Graphic from "@arcgis/core/Graphic";
 import Point from "@arcgis/core/geometry/Point";
 import * as geometryJsonUtils from "@arcgis/core/geometry/support/jsonUtils";
+import { BOUNDARIES_SERVICE_URL, MAP_ELEMENT_SELECTOR } from "./arcgisConfig";
 
-// ── Service config ────────────────────────────────────────────────────────────
+// ── Service config ───────────────────────────────────────────────────────────────────
 
-const BOUNDARIES_BASE =
-  "https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/WOR_Boundaries_2024/FeatureServer";
+/** @deprecated — use BOUNDARIES_SERVICE_URL from arcgisConfig */
+const BOUNDARIES_BASE = BOUNDARIES_SERVICE_URL;
 
 /** Layer IDs inside WOR_Boundaries_2024 */
 export const LAYER_REGION = 0;
@@ -210,6 +211,28 @@ function buildSummaryHtml(summary?: string): string {
   return `<p style="margin:0;color:#2f3a45;font-size:0.82rem;line-height:1.5">${esc(normalized)}</p>`;
 }
 
+function isPreviewImageUrl(url: string): boolean {
+  return /^https?:\/\/\S+/i.test(url) && /\.(?:png|jpe?g|gif|webp|bmp|svg)(?:[?#].*)?$/i.test(url);
+}
+
+function findPreviewImageUrl(ctx?: GeoContext): string | undefined {
+  return ctx?.links?.find((link) => isPreviewImageUrl(link.url))?.url;
+}
+
+function buildImageCardHtml(imageUrl?: string, title = "Preview image"): string {
+  if (!imageUrl) return "";
+  return `<figure style="margin:0 0 12px;border-radius:14px;overflow:hidden;border:1px solid #d9e5ee;background:linear-gradient(180deg,#f8fbfd 0%,#eef5f9 100%);box-shadow:0 10px 24px rgba(39,77,102,0.10)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:1px solid #e2edf3;background:rgba(255,255,255,0.75)">
+        <div style="font-size:0.73rem;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;color:#506473">${esc(title)}</div>
+        <a href="${esc(imageUrl)}" target="_blank" rel="noopener noreferrer" style="font-size:0.74rem;font-weight:600;color:#005e95;text-decoration:none">Open full image</a>
+      </div>
+      <img src="${esc(imageUrl)}" alt="${esc(title)}"
+           loading="lazy" referrerpolicy="no-referrer"
+           style="width:100%;max-height:220px;object-fit:cover;display:block;background:#edf3f7"
+           onerror="var figure=this.closest('figure'); if(figure){figure.style.display='none';}" />
+    </figure>`;
+}
+
 function buildLinksHtml(links?: Array<{ url: string; label: string }>): string {
   if (!links?.length) return "";
   return `
@@ -322,19 +345,42 @@ function buildContextHtml(ctx?: GeoContext): string {
       `</table>`
     : "";
 
+  const imageHtml = buildImageCardHtml(findPreviewImageUrl(ctx), "Linked preview");
   const summaryHtml = buildSummaryHtml(ctx.summary);
   const linksHtml = buildLinksHtml(ctx.links);
   const heading = formatSectionTitle(ctx);
 
   return `
-    <div style="margin-top:12px;padding-top:10px;border-top:1px solid #e2e7ec">
+    <div style="margin-top:12px;padding:12px 12px 0;border-top:1px solid #e2e7ec;background:linear-gradient(180deg,rgba(247,250,252,0.95) 0%,rgba(255,255,255,0.98) 100%);border-radius:12px">
       <div style="font-size:0.74rem;font-weight:700;color:#62707c;text-transform:uppercase;
                   letter-spacing:0.05em;margin-bottom:7px">${esc(heading)}</div>
-      ${fieldsHtml}${summaryHtml}${linksHtml}
+      ${imageHtml}${fieldsHtml}${summaryHtml}${linksHtml}
     </div>`;
 }
 
-function buildCountryPopupContent(attrs: Record<string, any>, ctx?: GeoContext): string {
+function buildDerivedAreaExplanation(
+  kind: "country" | "region",
+  origin: GeoOrigin,
+  description?: string,
+): string {
+  const explicit = description?.trim();
+  if (explicit) {
+    return `<p style="margin:0 0 8px;color:#2f3a45;font-size:0.84rem;line-height:1.5">${esc(explicit)}</p>`;
+  }
+
+  const originLabel = origin === "source" ? "the MCP source data" : "the assistant context";
+  const subject = kind === "country"
+    ? "This country boundary was rendered"
+    : "This region boundary was rendered";
+  return `<p style="margin:0 0 8px;color:#2f3a45;font-size:0.84rem;line-height:1.5">${subject} because ${originLabel} referred to this ${kind} as relevant context for the answer.</p>`;
+}
+
+function buildCountryPopupContent(
+  attrs: Record<string, any>,
+  origin: GeoOrigin,
+  description?: string,
+  ctx?: GeoContext,
+): string {
   const details = buildRows([
     { label: "Capital", value: firstValue(attrs, ["CAPITAL", "CAPNAME"]) },
     { label: "Region", value: firstValue(attrs, ["SUBREGION", "SUB_REGION", "REGION"]) },
@@ -343,12 +389,18 @@ function buildCountryPopupContent(attrs: Record<string, any>, ctx?: GeoContext):
 
   return `
     <div style="font-family:var(--calcite-sans-family,sans-serif);line-height:1.5">
+      ${buildDerivedAreaExplanation("country", origin, description)}
       ${details}
       ${buildContextHtml(ctx)}
     </div>`;
 }
 
-function buildRegionPopupContent(attrs: Record<string, any>, ctx?: GeoContext): string {
+function buildRegionPopupContent(
+  attrs: Record<string, any>,
+  origin: GeoOrigin,
+  description?: string,
+  ctx?: GeoContext,
+): string {
   const details = buildRows([
     { label: "Country", value: firstValue(attrs, ["NAME"]) },
     { label: "Sub-region", value: firstValue(attrs, ["SUBREGION", "CONTINENT"]) },
@@ -357,6 +409,7 @@ function buildRegionPopupContent(attrs: Record<string, any>, ctx?: GeoContext): 
 
   return `
     <div style="font-family:var(--calcite-sans-family,sans-serif);line-height:1.5">
+      ${buildDerivedAreaExplanation("region", origin, description)}
       ${details}
       ${buildContextHtml(ctx)}
     </div>`;
@@ -367,10 +420,12 @@ function buildPointPopupContent(pt: GeoPoint): string {
   const summaryBadge = badge(semanticType === "air" ? "Air quality" : semanticType.charAt(0).toUpperCase() + semanticType.slice(1), "accent");
   const originBadge = badge(pt.origin === "source" ? "Source geometry" : "Context geometry");
   const desc = pt.description ? `<p style="margin:8px 0 0;font-size:0.84rem;color:#2f3a45;line-height:1.45">${esc(pt.description)}</p>` : "";
+  const imageHtml = buildImageCardHtml(findPreviewImageUrl(pt.context), `${pt.label} preview`);
   return `
-    <div style="font-family:var(--calcite-sans-family,sans-serif);font-size:0.88rem;line-height:1.5">
+    <div style="font-family:var(--calcite-sans-family,sans-serif);font-size:0.88rem;line-height:1.5;min-width:220px">
+      ${imageHtml}
       <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${summaryBadge}${originBadge}</div>
-      <table style="border-collapse:collapse;min-width:170px">
+      <table style="border-collapse:collapse;min-width:170px;background:#fbfdfe;border:1px solid #e0e9ef;border-radius:10px">
         <tr><td ${CL}>Lat / Lon</td><td ${CV}>${pt.lat.toFixed(4)}&deg;, ${pt.lon.toFixed(4)}&deg;</td></tr>
       </table>
       ${desc}
@@ -428,7 +483,12 @@ function countryFeatureToGraphic(feature: any, entity?: GeoCountry): Graphic | n
     attributes: { ...attrs, _displayName: name },
     popupTemplate: {
       title: `{NAME}`,
-      content: buildCountryPopupContent(attrs, entity?.context),
+      content: buildCountryPopupContent(
+        attrs,
+        entity?.origin ?? "source",
+        entity?.description,
+        entity?.context,
+      ),
     } as any,
   });
 }
@@ -486,7 +546,12 @@ function regionFeatureToGraphic(feature: any, entity?: GeoRegion): Graphic | nul
     attributes: { ...attrs },
     popupTemplate: {
       title: name ? `${name} — ${region}` : region,
-      content: buildRegionPopupContent(attrs, entity?.context),
+      content: buildRegionPopupContent(
+        attrs,
+        entity?.origin ?? "source",
+        entity?.description,
+        entity?.context,
+      ),
     } as any,
   });
 }
@@ -532,7 +597,7 @@ export async function renderMcpGeoEntities(
 ): Promise<void> {
   if (!entities.length) return;
 
-  const mapEl = document.querySelector("#main-map") as any;
+  const mapEl = document.querySelector(MAP_ELEMENT_SELECTOR) as any;
   const view: any = mapEl?.view;
   if (!view?.map) return;
 
@@ -540,26 +605,31 @@ export async function renderMcpGeoEntities(
   const old = view.map.findLayerById(MCP_GEO_LAYER_ID);
   if (old) view.map.remove(old);
 
-  const sourceLayer = new GraphicsLayer({
-    id: MCP_GEO_SOURCE_LAYER_ID,
-    title: "Source Geometry",
-    listMode: "show",
-  });
-  const contextLayer = new GraphicsLayer({
-    id: MCP_GEO_CONTEXT_LAYER_ID,
-    title: "Context Geometry",
-    listMode: "show",
-  });
-
   const sourceEntities = entities.filter((entity) => entity.origin === "source");
   const contextEntities = entities.filter((entity) => entity.origin === "context");
+  function createEntityLayer(id: string, title: string): GraphicsLayer {
+    return new GraphicsLayer({
+      id,
+      title,
+      listMode: "show",
+    });
+  }
 
-  async function addEntitiesToLayer(targetLayer: GraphicsLayer, layerEntities: GeoEntity[]): Promise<void> {
-    const countries = layerEntities.filter((e): e is GeoCountry => e.kind === "country");
-    const regions = layerEntities.filter((e): e is GeoRegion => e.kind === "region");
-    const points = layerEntities.filter((e): e is GeoPoint => e.kind === "point");
-    const addRepresentativePoints = points.length === 0;
+  const sourcePointEntities = sourceEntities.filter((e): e is GeoPoint => e.kind === "point");
+  const sourceCountryEntities = sourceEntities.filter((e): e is GeoCountry => e.kind === "country");
+  const sourceRegionEntities = sourceEntities.filter((e): e is GeoRegion => e.kind === "region");
+  const contextPointEntities = contextEntities.filter((e): e is GeoPoint => e.kind === "point");
+  const contextCountryEntities = contextEntities.filter((e): e is GeoCountry => e.kind === "country");
+  const contextRegionEntities = contextEntities.filter((e): e is GeoRegion => e.kind === "region");
 
+  const sourcePointsLayer = createEntityLayer(`${MCP_GEO_SOURCE_LAYER_ID}-points`, "Source Points");
+  const sourceCountriesLayer = createEntityLayer(`${MCP_GEO_SOURCE_LAYER_ID}-countries`, "Source Countries");
+  const sourceRegionsLayer = createEntityLayer(`${MCP_GEO_SOURCE_LAYER_ID}-regions`, "Source Regions");
+  const contextPointsLayer = createEntityLayer(`${MCP_GEO_CONTEXT_LAYER_ID}-points`, "Context Points");
+  const contextCountriesLayer = createEntityLayer(`${MCP_GEO_CONTEXT_LAYER_ID}-countries`, "Context Countries");
+  const contextRegionsLayer = createEntityLayer(`${MCP_GEO_CONTEXT_LAYER_ID}-regions`, "Context Regions");
+
+  async function addPointEntitiesToLayer(targetLayer: GraphicsLayer, points: GeoPoint[]): Promise<void> {
     for (const pt of points) {
       const g = new Graphic({
         geometry: new Point({ latitude: pt.lat, longitude: pt.lon }),
@@ -572,7 +642,12 @@ export async function renderMcpGeoEntities(
       });
       targetLayer.add(g);
     }
+  }
 
+  async function addCountryEntitiesToLayer(
+    targetLayer: GraphicsLayer,
+    countries: GeoCountry[],
+  ): Promise<void> {
     if (countries.length) {
       const list = countries
         .map((c) => `'${c.name.replace(/'/g, "''")}'`)
@@ -583,13 +658,14 @@ export async function renderMcpGeoEntities(
         const entity = countries.find((c) => c.name.toLowerCase() === name);
         const g = countryFeatureToGraphic(feat, entity);
         if (g) targetLayer.add(g);
-        if (addRepresentativePoints) {
-          const center = countryCenterPointGraphic(feat, entity);
-          if (center) targetLayer.add(center);
-        }
       }
     }
+  }
 
+  async function addRegionEntitiesToLayer(
+    targetLayer: GraphicsLayer,
+    regions: GeoRegion[],
+  ): Promise<void> {
     if (regions.length) {
       const normalised = regions.map((r) => ({
         ...r,
@@ -604,17 +680,17 @@ export async function renderMcpGeoEntities(
         const entity = normalised.find((r) => r.normalised === featureRegion);
         const g = regionFeatureToGraphic(feat, entity);
         if (g) targetLayer.add(g);
-        if (addRepresentativePoints) {
-          const center = regionCenterPointGraphic(feat, entity);
-          if (center) targetLayer.add(center);
-        }
       }
     }
   }
 
   const layersToAdd = [] as GraphicsLayer[];
-  if (sourceEntities.length) layersToAdd.push(sourceLayer);
-  if (contextEntities.length) layersToAdd.push(contextLayer);
+  if (sourcePointEntities.length) layersToAdd.push(sourcePointsLayer);
+  if (sourceCountryEntities.length) layersToAdd.push(sourceCountriesLayer);
+  if (sourceRegionEntities.length) layersToAdd.push(sourceRegionsLayer);
+  if (contextPointEntities.length) layersToAdd.push(contextPointsLayer);
+  if (contextCountryEntities.length) layersToAdd.push(contextCountriesLayer);
+  if (contextRegionEntities.length) layersToAdd.push(contextRegionsLayer);
   if (!layersToAdd.length) return;
 
   const group = new GroupLayer({
@@ -627,13 +703,21 @@ export async function renderMcpGeoEntities(
   view.map.add(group);
 
   const loadingTasks = [
-    addEntitiesToLayer(sourceLayer, sourceEntities),
-    addEntitiesToLayer(contextLayer, contextEntities),
+    addPointEntitiesToLayer(sourcePointsLayer, sourcePointEntities),
+    addCountryEntitiesToLayer(sourceCountriesLayer, sourceCountryEntities),
+    addRegionEntitiesToLayer(sourceRegionsLayer, sourceRegionEntities),
+    addPointEntitiesToLayer(contextPointsLayer, contextPointEntities),
+    addCountryEntitiesToLayer(contextCountriesLayer, contextCountryEntities),
+    addRegionEntitiesToLayer(contextRegionsLayer, contextRegionEntities),
   ];
 
   const initialGraphics = [
-    ...((sourceLayer.graphics as any).toArray?.() ?? []),
-    ...((contextLayer.graphics as any).toArray?.() ?? []),
+    ...((sourcePointsLayer.graphics as any).toArray?.() ?? []),
+    ...((sourceCountriesLayer.graphics as any).toArray?.() ?? []),
+    ...((sourceRegionsLayer.graphics as any).toArray?.() ?? []),
+    ...((contextPointsLayer.graphics as any).toArray?.() ?? []),
+    ...((contextCountriesLayer.graphics as any).toArray?.() ?? []),
+    ...((contextRegionsLayer.graphics as any).toArray?.() ?? []),
   ];
   if (initialGraphics.length) {
     try {
@@ -649,8 +733,12 @@ export async function renderMcpGeoEntities(
   await Promise.all(loadingTasks);
 
   const allGraphics = [
-    ...((sourceLayer.graphics as any).toArray?.() ?? []),
-    ...((contextLayer.graphics as any).toArray?.() ?? []),
+    ...((sourcePointsLayer.graphics as any).toArray?.() ?? []),
+    ...((sourceCountriesLayer.graphics as any).toArray?.() ?? []),
+    ...((sourceRegionsLayer.graphics as any).toArray?.() ?? []),
+    ...((contextPointsLayer.graphics as any).toArray?.() ?? []),
+    ...((contextCountriesLayer.graphics as any).toArray?.() ?? []),
+    ...((contextRegionsLayer.graphics as any).toArray?.() ?? []),
   ];
   if (allGraphics.length && allGraphics.length !== initialGraphics.length) {
     try {
@@ -666,7 +754,7 @@ export async function renderMcpGeoEntities(
 
 /** Remove the MCP geo layer from the map (call on conversation reset etc.). */
 export function clearMcpGeoLayer(): void {
-  const mapEl = document.querySelector("#main-map") as any;
+  const mapEl = document.querySelector(MAP_ELEMENT_SELECTOR) as any;
   const view: any = mapEl?.view;
   if (!view?.map) return;
   const old = view.map.findLayerById(MCP_GEO_LAYER_ID);

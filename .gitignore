@@ -25,6 +25,9 @@ dist/
 mcp-hub.config.json
 mcp-hub.config.local.json
 
+# MCP knowledge base — auto-generated at runtime by the hub server
+mcp-knowledge-base.json
+
 # Demo/presenter assets (not for publish)
 demo-script-8-10min.md
 

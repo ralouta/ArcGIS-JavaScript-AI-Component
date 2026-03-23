@@ -69,6 +69,52 @@ interface ServerState {
   tools: ToolDef[];
 }
 
+interface KnowledgeBaseToolField {
+  name: string;
+  type: string;
+  required: boolean;
+  description?: string;
+}
+
+interface KnowledgeBaseToolRecord {
+  name: string;
+  description?: string;
+  fieldCount: number;
+  requiredFieldCount: number;
+  fields: KnowledgeBaseToolField[];
+}
+
+interface KnowledgeBaseServerRecord {
+  id: string;
+  label: string;
+  transport: "url" | "stdio";
+  endpoint?: string;
+  command?: string;
+  enabled: boolean;
+  status: ServerState["status"];
+  error: string | null;
+  toolCount: number;
+  capabilitySummary: string[];
+  tools: KnowledgeBaseToolRecord[];
+  lastValidatedAt?: string;
+}
+
+interface McpKnowledgeBaseDocument {
+  schemaVersion: 1;
+  generatedAt: string;
+  source: {
+    configPath: string;
+    hubName: string;
+  };
+  summary: {
+    serverCount: number;
+    enabledCount: number;
+    runningCount: number;
+    documentedToolCount: number;
+  };
+  servers: KnowledgeBaseServerRecord[];
+}
+
 // ── Config persistence ────────────────────────────────────────────────────────
 
 // Resolve config path:
@@ -90,6 +136,7 @@ function resolveConfigPath(): string {
 }
 
 const CONFIG_PATH = resolveConfigPath();
+const KNOWLEDGE_BASE_PATH = resolve("mcp-knowledge-base.json");
 
 function loadConfig(): HubConfig {
   if (!existsSync(CONFIG_PATH)) {
@@ -227,6 +274,120 @@ const serverStates = new Map<string, ServerState>();
 /** Map qualified-tool-name → server id. */
 const toolRouter = new Map<string, string>();
 
+function inferFieldType(schema: Record<string, unknown> | undefined, key: string): string {
+  const properties = schema?.properties;
+  const property = properties && typeof properties === "object" && !Array.isArray(properties)
+    ? (properties as Record<string, unknown>)[key]
+    : undefined;
+  if (!property || typeof property !== "object" || Array.isArray(property)) return "unknown";
+
+  const typeValue = (property as Record<string, unknown>).type;
+  if (Array.isArray(typeValue)) return typeValue.map((value) => String(value)).join(" | ");
+  if (typeof typeValue === "string" && typeValue.trim()) return typeValue;
+
+  if (Array.isArray((property as Record<string, unknown>).enum)) return "enum";
+  if ((property as Record<string, unknown>).properties) return "object";
+  if ((property as Record<string, unknown>).items) return "array";
+  return "unknown";
+}
+
+function extractToolFields(inputSchema?: Record<string, unknown>): KnowledgeBaseToolField[] {
+  const properties = inputSchema?.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return [];
+
+  const required = new Set(
+    Array.isArray(inputSchema?.required) ? inputSchema.required.map((value) => String(value)) : [],
+  );
+
+  return Object.entries(properties as Record<string, unknown>).map(([name, property]) => ({
+    name,
+    type: inferFieldType(inputSchema, name),
+    required: required.has(name),
+    description:
+      property && typeof property === "object" && !Array.isArray(property) && typeof (property as Record<string, unknown>).description === "string"
+        ? String((property as Record<string, unknown>).description)
+        : undefined,
+  }));
+}
+
+function summarizeCapabilities(tools: KnowledgeBaseToolRecord[]): string[] {
+  const phrases = tools.map((tool) => {
+    const description = tool.description?.trim();
+    if (description) return description.replace(/\s+/g, " ").replace(/[.\s]+$/g, "");
+    return tool.name.replace(/[_-]+/g, " ");
+  });
+
+  return [...new Set(phrases)].slice(0, 12);
+}
+
+function loadExistingKnowledgeBase(): McpKnowledgeBaseDocument | null {
+  if (!existsSync(KNOWLEDGE_BASE_PATH)) return null;
+  try {
+    return JSON.parse(readFileSync(KNOWLEDGE_BASE_PATH, "utf-8")) as McpKnowledgeBaseDocument;
+  } catch {
+    return null;
+  }
+}
+
+function buildKnowledgeBaseDocument(): McpKnowledgeBaseDocument {
+  const previous = loadExistingKnowledgeBase();
+  const previousById = new Map((previous?.servers ?? []).map((server) => [server.id, server]));
+
+  const servers: KnowledgeBaseServerRecord[] = Array.from(serverStates.values()).map((state) => {
+    const previousRecord = previousById.get(state.config.id);
+    const tools = state.tools.length
+      ? state.tools.map((tool) => {
+          const fields = extractToolFields(tool.inputSchema);
+          return {
+            name: tool.name,
+            description: tool.description,
+            fieldCount: fields.length,
+            requiredFieldCount: fields.filter((field) => field.required).length,
+            fields,
+          };
+        })
+      : previousRecord?.tools ?? [];
+
+    const hasValidatedTools = state.tools.length > 0;
+    return {
+      id: state.config.id,
+      label: state.config.label,
+      transport: state.config.transport,
+      endpoint: state.config.url,
+      command: state.config.command,
+      enabled: state.config.enabled,
+      status: state.status,
+      error: state.error,
+      toolCount: tools.length,
+      capabilitySummary: tools.length ? summarizeCapabilities(tools) : previousRecord?.capabilitySummary ?? [],
+      tools,
+      lastValidatedAt: hasValidatedTools ? new Date().toISOString() : previousRecord?.lastValidatedAt,
+    };
+  });
+
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    source: {
+      configPath: CONFIG_PATH,
+      hubName: "mcp-local-hub",
+    },
+    summary: {
+      serverCount: servers.length,
+      enabledCount: servers.filter((server) => server.enabled).length,
+      runningCount: servers.filter((server) => server.status === "running").length,
+      documentedToolCount: servers.reduce((total, server) => total + server.toolCount, 0),
+    },
+    servers,
+  };
+}
+
+function saveKnowledgeBase(): McpKnowledgeBaseDocument {
+  const document = buildKnowledgeBaseDocument();
+  writeFileSync(KNOWLEDGE_BASE_PATH, JSON.stringify(document, null, 2));
+  return document;
+}
+
 // ── Server lifecycle ──────────────────────────────────────────────────────────
 
 async function startServer(state: ServerState): Promise<void> {
@@ -349,6 +510,7 @@ function rebuildToolRouter(): void {
       toolRouter.set(`${serverId}__${t.name}`, serverId);
     }
   }
+  saveKnowledgeBase();
 }
 
 function getAggregatedTools() {
@@ -415,6 +577,14 @@ function buildApp() {
     res.json({
       servers: Array.from(serverStates.values()).map(serializeState),
     });
+  });
+
+  app.get("/knowledge-base", (_req: Request, res: Response) => {
+    res.json(saveKnowledgeBase());
+  });
+
+  app.post("/knowledge-base/rebuild", (_req: Request, res: Response) => {
+    res.json(saveKnowledgeBase());
   });
 
   // Add a server
@@ -642,6 +812,8 @@ async function main() {
       await startServer(state);
     }
   }
+
+  saveKnowledgeBase();
 
   const app = buildApp();
   app.listen(port, () => {

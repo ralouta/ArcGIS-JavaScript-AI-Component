@@ -1,9 +1,21 @@
 import FeatureLayer from "@arcgis/core/layers/FeatureLayer";
 import Graphic from "@arcgis/core/Graphic";
+import ImageryLayer from "@arcgis/core/layers/ImageryLayer";
+import ImageryTileLayer from "@arcgis/core/layers/ImageryTileLayer";
+import MapImageLayer from "@arcgis/core/layers/MapImageLayer";
 import type {
   AssistantGeoMemorySnapshot,
   AssistantResultEntity,
 } from "./assistantState";
+import { GEOCODER_URL, MAP_ELEMENT_SELECTOR } from "./arcgisConfig";
+
+export type AddableLayerKind = "feature" | "imagery" | "geotiff" | "map-image";
+
+export interface AddableLayerSpec {
+  url: string;
+  title?: string;
+  kind?: AddableLayerKind;
+}
 
 export interface PointFeatureDraft {
   geometry: { type: "point"; longitude: number; latitude: number };
@@ -59,6 +71,19 @@ function normalizeLayerUrl(url: string): string {
   return /\/\d+$/.test(trimmed) ? trimmed : `${trimmed}/0`;
 }
 
+function normalizeGenericLayerUrl(url: string): string {
+  return url.trim().replace(/\/+$/, "");
+}
+
+function inferLayerKind(url: string, explicitKind?: AddableLayerKind): AddableLayerKind {
+  if (explicitKind) return explicitKind;
+  const normalizedUrl = normalizeGenericLayerUrl(url).toLowerCase();
+  if (/\.(tif|tiff)(\?|$)/i.test(normalizedUrl)) return "geotiff";
+  if (/\/imageserver$/i.test(normalizedUrl)) return "imagery";
+  if (/\/(mapserver)(\/\d+)?$/i.test(normalizedUrl)) return "map-image";
+  return "feature";
+}
+
 function toWhereSafeValue(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -106,7 +131,7 @@ async function geocodeSingleLine(singleLine: string): Promise<{ latitude: number
 
   try {
     const response = await fetch(
-      `https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?${params.toString()}`,
+      `${GEOCODER_URL}?${params.toString()}`,
     );
     if (!response.ok) return null;
     const json: any = await response.json();
@@ -222,7 +247,7 @@ export async function addPointFeaturesToLayer(
 }
 
 export async function addFeatureLayerToCurrentMap(layerUrl: string, title?: string): Promise<void> {
-  const mapEl = document.querySelector("#main-map") as any;
+  const mapEl = document.querySelector(MAP_ELEMENT_SELECTOR) as any;
   const view = mapEl?.view;
   if (!view?.map) return;
   const normalized = normalizeLayerUrl(layerUrl);
@@ -230,6 +255,33 @@ export async function addFeatureLayerToCurrentMap(layerUrl: string, title?: stri
   if (existing) return;
   const layer = new FeatureLayer({ url: normalized, title: title?.trim() || undefined });
   view.map.add(layer);
+}
+
+export async function addLayerToCurrentMap(spec: AddableLayerSpec): Promise<void> {
+  const mapEl = document.querySelector(MAP_ELEMENT_SELECTOR) as any;
+  const view = mapEl?.view;
+  if (!view?.map) return;
+
+  const kind = inferLayerKind(spec.url, spec.kind);
+  const title = spec.title?.trim() || undefined;
+  const normalizedUrl = kind === "feature" ? normalizeLayerUrl(spec.url) : normalizeGenericLayerUrl(spec.url);
+  const existing = view.map.layers.find((layer: any) => layer?.url === normalizedUrl);
+  if (existing) return;
+
+  const layer = (() => {
+    switch (kind) {
+      case "geotiff":
+        return new ImageryTileLayer({ url: normalizedUrl, title });
+      case "imagery":
+        return new ImageryLayer({ url: normalizedUrl, title });
+      case "map-image":
+        return new MapImageLayer({ url: normalizedUrl, title });
+      default:
+        return new FeatureLayer({ url: normalizedUrl, title });
+    }
+  })();
+
+  view.map.add(layer as any);
 }
 
 export async function deleteFeaturesByName(layerUrl: string, name: string): Promise<FeatureEditSummary> {

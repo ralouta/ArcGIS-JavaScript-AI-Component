@@ -865,8 +865,13 @@ export async function searchPortalLayerByName(name: string): Promise<string | nu
     const items: any[] = Array.isArray(json?.results) ? json.results : [];
     // exact title match first, then case-insensitive
     const search = name.trim().toLowerCase();
-    const exact = items.find((item) => item?.title?.toLowerCase() === search);
-    const item = exact ?? items.find((item) => item?.title?.toLowerCase().includes(search));
+    const supportedItems = items.filter((item) => {
+      const itemUrl = typeof item?.url === "string" ? item.url.trim() : "";
+      if (!itemUrl) return false;
+      return /\/(?:FeatureServer)(?:\/\d+)?$/i.test(itemUrl.replace(/\?.*$/, "").replace(/\/+$/, ""));
+    });
+    const exact = supportedItems.find((item) => item?.title?.toLowerCase() === search);
+    const item = exact ?? supportedItems.find((item) => item?.title?.toLowerCase().includes(search));
     if (!item) return null;
     // item.url is the FeatureServer root; append /0 if needed
     if (item.url) {
