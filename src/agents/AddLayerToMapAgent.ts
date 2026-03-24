@@ -48,6 +48,16 @@ function normalizeServiceUrl(url: string): string {
   return /\/\d+$/.test(trimmed) ? trimmed : `${trimmed}/0`;
 }
 
+function isCatalogListingRequest(text: string): boolean {
+  if (!text.trim()) return false;
+
+  const catalogSignals = /\b(stac|asset catalog|catalog|collection|collections)\b/i;
+  const listingSignals =
+    /\b(latest|recent|newest|list|show|get|find)\b.*\b(items?|assets?|scenes?)\b|\b(items?|assets?|scenes?)\b.*\b(latest|recent|newest)\b/i;
+
+  return catalogSignals.test(text) && listingSignals.test(text);
+}
+
 async function resolveLayerUrl(
   title: string | null,
   itemId: string | null,
@@ -112,6 +122,13 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
     async function addLayerNode(s: any) {
       const text = extractLastUserText(s);
 
+      if (isCatalogListingRequest(text)) {
+        return {
+          outputMessage:
+            "This request is asking for STAC or catalog items, not to add a FeatureServer layer to the map. It should be handled by the MCP catalog tools rather than the Add Layer agent.",
+        };
+      }
+
       // ── Extract intent ──────────────────────────────────────────────────
       let intent: { title: string | null; itemId: string | null; serviceUrl: string | null } =
         { title: null, itemId: null, serviceUrl: null };
@@ -121,7 +138,8 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
           promptText:
             "You extract parameters needed to add a feature layer to a map. " +
             "Always call extract_add_layer_intent with everything you find. " +
-            "The user may provide a title/name, an item ID, or a service URL — extract whichever is present.",
+            "The user may provide a title/name, an item ID, or a service URL — extract whichever is present. " +
+            "Do not treat STAC catalogs, asset catalogs, collection browsing, or item-list requests as layer-add requests.",
           messages: [new HumanMessage(text || "add layer to map")],
           tools: [addLayerTool],
           temperature: 0,
@@ -163,7 +181,7 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
     id: agentId,
     name: "Add Layer to Map",
     description:
-      "Adds a hosted feature layer to the current map. Accepts a layer title/name (searches ArcGIS Online), an ArcGIS Online item ID, or a direct FeatureServer URL. Use when the user wants to load, show, display, or add a layer to the map.",
+      "Adds a hosted feature layer to the current map. Accepts a layer title/name (searches ArcGIS Online), an ArcGIS Online item ID, or a direct FeatureServer URL. Use only when the user wants to load or add a FeatureServer layer into the map. Do not use for STAC, asset catalog, collection, or item-listing requests.",
     createGraph,
     workspace: {},
   } as any;

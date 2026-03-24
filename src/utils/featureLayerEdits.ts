@@ -129,6 +129,8 @@ export async function buildPointFeatureDraftsFromMemory(
   const seen = new Set<string>();
 
   for (const entity of snapshot.entities) {
+    if (entity.kind === "extent") continue;
+
     let latitude = entity.lat;
     let longitude = entity.lon;
 

@@ -11,6 +11,7 @@ Most of this app has been vibe coded with various coding agents. Review the code
 - Sign in with ArcGIS and load an existing WebMap or create a new one.
 - Use built-in map-aware assistant tools for navigation and data exploration.
 - Use MCP-backed tools for external workflows such as weather, catalog, or custom server tasks.
+- Render MCP geography on the map when results include places, ranked city lists, or bounding boxes.
 - Create and manage hosted feature layers from assistant results.
 
 ## Local Development Requirements
@@ -105,6 +106,7 @@ Example prompts:
 - `add the Utrecht Parks layer to the map`
 - `load the layer with item id 3e2f1ab4c8d94567890abcdef1234567`
 - `add this layer to the map: https://services.arcgis.com/your-org/arcgis/rest/services/MyService/FeatureServer/0`
+
 
 ## MCP Hub
 

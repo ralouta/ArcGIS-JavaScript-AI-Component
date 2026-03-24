@@ -2,6 +2,7 @@ import GraphicsLayer from "@arcgis/core/layers/GraphicsLayer";
 import GroupLayer from "@arcgis/core/layers/GroupLayer";
 import Graphic from "@arcgis/core/Graphic";
 import Point from "@arcgis/core/geometry/Point";
+import Polygon from "@arcgis/core/geometry/Polygon";
 import * as geometryJsonUtils from "@arcgis/core/geometry/support/jsonUtils";
 
 // ── Service config ────────────────────────────────────────────────────────────
@@ -89,7 +90,19 @@ export interface GeoRegion {
   context?: GeoContext;
 }
 
-export type GeoEntity = GeoPoint | GeoCountry | GeoRegion;
+export interface GeoExtent {
+  kind: "extent";
+  origin: GeoOrigin;
+  label: string;
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+  description?: string;
+  context?: GeoContext;
+}
+
+export type GeoEntity = GeoPoint | GeoCountry | GeoRegion | GeoExtent;
 
 // ── REST query helpers ────────────────────────────────────────────────────────
 
@@ -133,6 +146,12 @@ const REGION_SYMBOL = {
   outline: { color: [194, 120, 0, 0.80], width: 1.4 },
 };
 
+const EXTENT_SYMBOL = {
+  type: "simple-fill",
+  color: [20, 131, 92, 0.08],
+  outline: { color: [20, 131, 92, 0.92], width: 1.8 },
+};
+
 /** Point marker — vivid blue with white halo */
 const POINT_SYMBOL = {
   type: "simple-marker",
@@ -165,7 +184,7 @@ type PointSemanticType = "weather" | "air" | "news" | "catalog" | "place";
 
 function badge(label: string, tone: "neutral" | "accent" = "neutral"): string {
   const style = tone === "accent"
-    ? "background:#e7f1fb;color:#005e95;border:1px solid #bed7ea"
+    ? "background:#edf6f4;color:#14624a;border:1px solid #cde4db"
     : "background:#f4f5f7;color:#4d5965;border:1px solid #d8dde3";
   return `<span style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:0.72rem;font-weight:600;${style}">${esc(label)}</span>`;
 }
@@ -186,6 +205,7 @@ function formatSectionTitle(ctx?: GeoContext, fallback = "Supporting Context"): 
 function normalizeSummary(summary: string): string {
   return summary
     .replace(/Tell me if you want[^.]*\.?/gi, "")
+    .replace(/Would you like[^.]*\.?/gi, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -195,6 +215,41 @@ function buildSummaryHtml(summary?: string): string {
   const normalized = normalizeSummary(summary);
   if (!normalized) return "";
 
+  const renderSummaryItem = (item: string): string => {
+    const trimmed = item.trim();
+    const quotedTitleMatch = trimmed.match(/^(.*?)\s+[—-]\s+["“](.+?)["”](.*)$/);
+    if (quotedTitleMatch) {
+      const source = quotedTitleMatch[1].trim().replace(/[—:\-]\s*$/, "");
+      const title = quotedTitleMatch[2].trim();
+      const tail = quotedTitleMatch[3].trim().replace(/^[-:;,]\s*/, "");
+      return `<li style="margin:0 0 8px;line-height:1.45">`
+        + `${source ? `<div style="font-size:0.74rem;font-weight:700;color:#6a7783;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">${esc(source)}</div>` : ""}`
+        + `<div style="font-size:0.85rem;font-weight:700;color:#23313d">${esc(title)}</div>`
+        + `${tail ? `<div style="font-size:0.8rem;color:#4d5965;margin-top:2px">${esc(tail)}</div>` : ""}`
+        + `</li>`;
+    }
+
+    const sentenceMatch = trimmed.match(/^([^:]{2,80}):\s*(.+)$/);
+    if (sentenceMatch) {
+      return `<li style="margin:0 0 6px;line-height:1.45"><span style="font-weight:700;color:#23313d">${esc(sentenceMatch[1].trim())}</span><span style="color:#4d5965">: ${esc(sentenceMatch[2].trim())}</span></li>`;
+    }
+
+    return `<li style="margin:0 0 6px;color:#2f3a45;line-height:1.45">${esc(trimmed)}</li>`;
+  };
+
+  const labeledItems = normalized
+    .split(/(?=\bSummary\b\s*:?)|(?=\bHeadline\b\s*:?)|(?=\bArticle\b\s*:?)|(?=\b-\s+[A-Z])/)
+    .map((item) => item.trim().replace(/^(Summary|Headline|Article)\s*:?\s*/i, ""))
+    .map((item) => item.replace(/^[-*•]\s*/, "").trim())
+    .filter((item) => item.length > 24);
+
+  if (labeledItems.length >= 2) {
+    return `<ul style="margin:0;padding-left:1.05rem;color:#2f3a45;font-size:0.82rem;line-height:1.45">${labeledItems
+      .slice(0, 3)
+      .map((item) => renderSummaryItem(item))
+      .join("")}</ul>`;
+  }
+
   const candidateItems = normalized
     .split(/\s+-\s+/)
     .map((item) => item.trim())
@@ -202,8 +257,8 @@ function buildSummaryHtml(summary?: string): string {
 
   if (candidateItems.length >= 2) {
     return `<ul style="margin:0;padding-left:1.05rem;color:#2f3a45;font-size:0.82rem;line-height:1.45">${candidateItems
-      .slice(0, 4)
-      .map((item) => `<li style="margin:0 0 4px">${esc(item)}</li>`)
+      .slice(0, 3)
+      .map((item) => renderSummaryItem(item))
       .join("")}</ul>`;
   }
 
@@ -213,7 +268,7 @@ function buildSummaryHtml(summary?: string): string {
 function buildLinksHtml(links?: Array<{ url: string; label: string }>): string {
   if (!links?.length) return "";
   return `
-    <div style="margin-top:8px">
+    <div style="margin-top:10px">
       <div style="font-size:0.72rem;font-weight:700;color:#62707c;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Resource Links</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px 8px">
         ${links
@@ -221,6 +276,31 @@ function buildLinksHtml(links?: Array<{ url: string; label: string }>): string {
             style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;color:#005e95;text-decoration:none;padding:4px 8px;border:1px solid #c7dbe8;border-radius:8px;background:#f6fbff">${esc(link.label)}</a>`)
           .join("")}
       </div>
+    </div>`;
+}
+
+function isPreviewImageUrl(url: string): boolean {
+  return /\.(png|jpe?g|gif|webp)(\?|$)/i.test(url) || /thumbnail|preview|browse|quicklook/i.test(url);
+}
+
+function findPreviewImageUrl(ctx?: GeoContext): string | null {
+  const fieldMatch = ctx?.mcpFields?.find((field) => /thumbnail|preview|image/i.test(field.label) && /^https?:\/\//i.test(field.value));
+  if (fieldMatch) return fieldMatch.value;
+
+  const linkMatch = ctx?.links?.find((link) => isPreviewImageUrl(link.url) || /thumbnail|preview|image/i.test(link.label));
+  return linkMatch?.url ?? null;
+}
+
+function buildImageCardHtml(ctx?: GeoContext): string {
+  const imageUrl = findPreviewImageUrl(ctx);
+  if (!imageUrl) return "";
+
+  return `
+    <div style="margin-top:10px">
+      <div style="font-size:0.72rem;font-weight:700;color:#62707c;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Preview</div>
+      <a href="${esc(imageUrl)}" target="_blank" rel="noopener noreferrer" style="display:block;text-decoration:none">
+        <img src="${esc(imageUrl)}" alt="Preview image" loading="lazy" referrerpolicy="no-referrer" style="display:block;width:100%;max-width:260px;max-height:180px;object-fit:cover;border-radius:10px;border:1px solid #d8dde3;background:#f4f6f8" onerror="this.style.display='none'" />
+      </a>
     </div>`;
 }
 
@@ -324,13 +404,14 @@ function buildContextHtml(ctx?: GeoContext): string {
 
   const summaryHtml = buildSummaryHtml(ctx.summary);
   const linksHtml = buildLinksHtml(ctx.links);
+  const imageHtml = buildImageCardHtml(ctx);
   const heading = formatSectionTitle(ctx);
 
   return `
     <div style="margin-top:12px;padding-top:10px;border-top:1px solid #e2e7ec">
       <div style="font-size:0.74rem;font-weight:700;color:#62707c;text-transform:uppercase;
                   letter-spacing:0.05em;margin-bottom:7px">${esc(heading)}</div>
-      ${fieldsHtml}${summaryHtml}${linksHtml}
+      ${imageHtml}${fieldsHtml}${summaryHtml}${linksHtml}
     </div>`;
 }
 
@@ -365,16 +446,36 @@ function buildRegionPopupContent(attrs: Record<string, any>, ctx?: GeoContext): 
 function buildPointPopupContent(pt: GeoPoint): string {
   const semanticType = inferPointSemanticType(pt);
   const summaryBadge = badge(semanticType === "air" ? "Air quality" : semanticType.charAt(0).toUpperCase() + semanticType.slice(1), "accent");
-  const originBadge = badge(pt.origin === "source" ? "Source geometry" : "Context geometry");
   const desc = pt.description ? `<p style="margin:8px 0 0;font-size:0.84rem;color:#2f3a45;line-height:1.45">${esc(pt.description)}</p>` : "";
+  const metadata = buildRows([
+    { label: "Place", value: pt.label },
+    { label: "Geometry", value: pt.origin === "source" ? "Source-derived point" : "Context-derived point" },
+    { label: "Lat / Lon", value: `${pt.lat.toFixed(4)}°, ${pt.lon.toFixed(4)}°` },
+  ]);
+
   return `
     <div style="font-family:var(--calcite-sans-family,sans-serif);font-size:0.88rem;line-height:1.5">
-      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${summaryBadge}${originBadge}</div>
-      <table style="border-collapse:collapse;min-width:170px">
-        <tr><td ${CL}>Lat / Lon</td><td ${CV}>${pt.lat.toFixed(4)}&deg;, ${pt.lon.toFixed(4)}&deg;</td></tr>
-      </table>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">${summaryBadge}</div>
       ${desc}
       ${buildContextHtml(pt.context)}
+      <div style="margin-top:12px;padding-top:10px;border-top:1px solid #e2e7ec">${metadata}</div>
+    </div>`;
+}
+
+function buildExtentPopupContent(extent: GeoExtent): string {
+  const summaryBadge = badge("Catalog tile", "accent");
+  const originBadge = badge(extent.origin === "source" ? "Map footprint" : "Context geometry");
+  const desc = extent.description ? `<p style="margin:8px 0 0;font-size:0.84rem;color:#2f3a45;line-height:1.45">${esc(extent.description)}</p>` : "";
+
+  return `
+    <div style="font-family:var(--calcite-sans-family,sans-serif);font-size:0.88rem;line-height:1.5">
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">${summaryBadge}${originBadge}</div>
+      <table style="border-collapse:collapse;min-width:190px">
+        <tr><td ${CL}>West / South</td><td ${CV}>${extent.west.toFixed(4)}, ${extent.south.toFixed(4)}</td></tr>
+        <tr><td ${CL}>East / North</td><td ${CV}>${extent.east.toFixed(4)}, ${extent.north.toFixed(4)}</td></tr>
+      </table>
+      ${desc}
+      ${buildContextHtml(extent.context)}
     </div>`;
 }
 
@@ -391,7 +492,7 @@ function buildLocationPointPopupContent(
 
   return `
     <div style="font-family:var(--calcite-sans-family,sans-serif);line-height:1.5">
-      <div style="font-size:0.84rem;color:#666;margin-bottom:6px">Representative point for ${esc(label)}</div>
+      <div style="font-size:0.84rem;color:#666;margin-bottom:6px">Marker placed near the center of ${esc(label)}</div>
       ${details}
       ${buildContextHtml(ctx)}
     </div>`;
@@ -402,6 +503,43 @@ function centerPointFromGeometry(geometry: any): Point | null {
   if (!center) return null;
   if (typeof center.latitude !== "number" || typeof center.longitude !== "number") return null;
   return new Point({ latitude: center.latitude, longitude: center.longitude });
+}
+
+function bboxToPolygon(extent: GeoExtent): Polygon {
+  return new Polygon({
+    spatialReference: { wkid: 4326 },
+    rings: [[
+      [extent.west, extent.south],
+      [extent.east, extent.south],
+      [extent.east, extent.north],
+      [extent.west, extent.north],
+      [extent.west, extent.south],
+    ]],
+  });
+}
+
+function extentGraphic(extent: GeoExtent): Graphic | null {
+  if (
+    [extent.west, extent.south, extent.east, extent.north].some((value) => !Number.isFinite(value)) ||
+    Math.abs(extent.west) > 180 ||
+    Math.abs(extent.east) > 180 ||
+    Math.abs(extent.south) > 90 ||
+    Math.abs(extent.north) > 90 ||
+    extent.west >= extent.east ||
+    extent.south >= extent.north
+  ) {
+    return null;
+  }
+
+  return new Graphic({
+    geometry: bboxToPolygon(extent),
+    symbol: EXTENT_SYMBOL as any,
+    attributes: { name: extent.label },
+    popupTemplate: {
+      title: `{name}`,
+      content: buildExtentPopupContent(extent),
+    } as any,
+  });
 }
 
 // ── Graphic factories ─────────────────────────────────────────────────────────
@@ -557,8 +695,15 @@ export async function renderMcpGeoEntities(
   async function addEntitiesToLayer(targetLayer: GraphicsLayer, layerEntities: GeoEntity[]): Promise<void> {
     const countries = layerEntities.filter((e): e is GeoCountry => e.kind === "country");
     const regions = layerEntities.filter((e): e is GeoRegion => e.kind === "region");
+    const extents = layerEntities.filter((e): e is GeoExtent => e.kind === "extent");
     const points = layerEntities.filter((e): e is GeoPoint => e.kind === "point");
-    const addRepresentativePoints = points.length === 0;
+    const polygonEntityCount = countries.length + regions.length;
+    const addRepresentativePoints = points.length === 0 && extents.length === 0 && polygonEntityCount === 1;
+
+    for (const extent of extents) {
+      const g = extentGraphic(extent);
+      if (g) targetLayer.add(g);
+    }
 
     for (const pt of points) {
       const g = new Graphic({
