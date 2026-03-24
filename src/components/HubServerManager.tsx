@@ -350,9 +350,10 @@ function statusColor(status: string): string {
 interface Props {
   open: boolean;
   onClose: () => void;
+  onServersChanged?: () => void;
 }
 
-export default function HubServerManager({ open, onClose }: Props) {
+export default function HubServerManager({ open, onClose, onServersChanged }: Props) {
   const [servers, setServers] = useState<HubServer[]>([]);
   const [loading, setLoading] = useState(false);
   const [hubError, setHubError] = useState<string | null>(null);
@@ -407,6 +408,10 @@ export default function HubServerManager({ open, onClose }: Props) {
     }
   }, [open, load]);
 
+  const notifyServersChanged = useCallback(() => {
+    onServersChanged?.();
+  }, [onServersChanged]);
+
   // ── Actions ─────────────────────────────────────────────────────────────
 
   const handleToggle = async (server: HubServer) => {
@@ -418,6 +423,7 @@ export default function HubServerManager({ open, onClose }: Props) {
       setServers((prev) =>
         prev.map((s) => (s.id === updated.id ? updated : s)),
       );
+      notifyServersChanged();
     } catch {}
     setBusy(false);
   };
@@ -427,6 +433,7 @@ export default function HubServerManager({ open, onClose }: Props) {
     try {
       await apiDeleteServer(id);
       setServers((prev) => prev.filter((s) => s.id !== id));
+      notifyServersChanged();
     } catch {}
     setBusy(false);
   };
@@ -465,6 +472,7 @@ export default function HubServerManager({ open, onClose }: Props) {
           prev.map((s) => (s.id === updated.id ? updated : s)),
         );
       }
+      notifyServersChanged();
       cancelEdit();
     } catch {}
     setBusy(false);
@@ -482,6 +490,7 @@ export default function HubServerManager({ open, onClose }: Props) {
       }
       setImportText("");
       await load();
+      notifyServersChanged();
     } catch (err: any) {
       setImportError(
         err?.message ??
