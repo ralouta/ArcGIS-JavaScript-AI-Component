@@ -237,6 +237,7 @@ function clearMcpCaches(endpointUrl: string): void {
   const key = normalizeUrl(endpointUrl);
   initializedEndpoints.delete(key);
   mcpToolsCache.delete(key);
+  hubServersCache.delete(key);
 }
 
 /** Discover tools from the MCP server. Cached after first call. */
@@ -596,6 +597,31 @@ function buildDescriptionFromTools(
     ...summarizedTools.map((line) => `- ${line}`),
     tools.length > summarizedTools.length ? `- ...and ${tools.length - summarizedTools.length} more MCP tools.` : "",
   ].filter(Boolean).join("\n");
+}
+
+export async function refreshMcpAgentDescription(assistant: HTMLElement): Promise<void> {
+  const agentEl = assistant.querySelector('[data-agent-id="mcp-passthrough-agent"]') as any;
+  if (!agentEl?.agent) return;
+
+  const baseUrl: string = agentEl._mcpBaseUrl ?? "";
+  const serverName: string = agentEl.agent.name ?? "MCP Server";
+  if (!baseUrl) return;
+
+  try {
+    clearMcpCaches(baseUrl);
+    const [tools, hubServers] = await Promise.all([
+      listMcpTools(baseUrl),
+      listHubServers(baseUrl),
+    ]);
+    if (tools.length) {
+      agentEl.agent = {
+        ...agentEl.agent,
+        description: buildDescriptionFromTools(tools, serverName, hubServers),
+      };
+    }
+  } catch {
+    // best-effort — keep the existing description
+  }
 }
 
 // ── LangGraph helpers ─────────────────────────────────────────────────────────
