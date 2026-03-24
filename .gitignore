@@ -24,8 +24,6 @@ dist/
 # Copy mcp-hub.config.example.json → mcp-hub.config.json to get started
 mcp-hub.config.json
 mcp-hub.config.local.json
-
-# MCP knowledge base — auto-generated at runtime by the hub server
 mcp-knowledge-base.json
 
 # Demo/presenter assets (not for publish)

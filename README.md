@@ -1,6 +1,6 @@
 # ArcGIS Agent Components Demo
 
-React + Vite app built with ArcGIS Maps SDK for JavaScript AI components (beta), and an MCP hub.
+React + Vite app built with ArcGIS Maps SDK, ArcGIS Assistant components, and an MCP hub.
 
 ## Disclaimer
 
@@ -11,6 +11,7 @@ Most of this app has been vibe coded with various coding agents. Review the code
 - Sign in with ArcGIS and load an existing WebMap or create a new one.
 - Use built-in map-aware assistant tools for navigation and data exploration.
 - Use MCP-backed tools for external workflows such as weather, catalog, or custom server tasks.
+- Render MCP geography on the map when results include places, ranked city lists, or bounding boxes.
 - Create and manage hosted feature layers from assistant results.
 
 ## Local Development Requirements
@@ -55,26 +56,9 @@ Update `mcp-hub.config.json` with the MCP servers you want to use and any local-
 
 ### 5. Configure ArcGIS OAuth
 
-1. Navigate to [ArcGIS Online](https://www.arcgis.com) and sign in with your username and password.
-2. Navigate to **Content** and click **Create folder**.
-3. Name the folder `ArcGISAIComponents` and click **Save**.
-4. Search for the folder created above and select it.
-5. Click **New item**.
-6. In the **New item** popup, click **Developer credentials**.
-7. Select **OAuth 2.0 credential — For user authentication** and click **Next**.
-8. In the **Redirect URLs** section, add the following URLs:
-   - `http://localhost:5173`
-   - `http://localhost:4173`
-9. Leave the rest as default and click **Next**.
-10. Fill in the following information:
-    - **Title:** `ArcGISAIComponentsCredentials_<your_username>` (e.g. `ArcGISAIComponentsCredentials_ralouta`)
-    - **Tags:** `AI`, `AI_Components`, `AI_Workshop`
-    - **Summary:** `Developer credentials for AI Workshop client app exercise.`
-11. Click **Next**.
-12. Read through the summary review and click **Create**.
-13. Copy the generated **Client ID** and navigate back to Visual Studio Code.
-14. In the VS Code Explorer, locate the `.env.local` file and open it.
-15. Replace the `VITE_ARCGIS_OAUTH_APP_ID` value with the copied Client ID.
+1. Create an ArcGIS OAuth app.
+2. Add redirect URLs: `http://localhost:5173` and `http://localhost:4173`.
+3. Copy the client ID into `VITE_ARCGIS_OAUTH_APP_ID`.
 
 ## Local Run Commands
 
@@ -123,6 +107,7 @@ Example prompts:
 - `load the layer with item id 3e2f1ab4c8d94567890abcdef1234567`
 - `add this layer to the map: https://services.arcgis.com/your-org/arcgis/rest/services/MyService/FeatureServer/0`
 
+
 ## MCP Hub
 
 The local hub in `hub/server.ts` aggregates multiple MCP servers behind one endpoint.
@@ -140,14 +125,6 @@ Arguments: mcp-remote https://your-remote-mcp-server.com/mcp
 ```
 
 The hub runs on port `8808` by default and is proxied through Vite at `/api/mcp` during development.
-
-### Hub Knowledge Base
-
-The hub automatically generates a `mcp-knowledge-base.json` file at startup and keeps it up to date whenever servers start, stop, or reconnect. This file is a machine-readable snapshot of every connected MCP server, its tools, field schemas, and capability summaries.
-
-The assistant uses this knowledge base at runtime to understand which MCP tools are available and how to invoke them — no manual authoring is required.
-
-Because the file is generated from your local server configuration, it is **git-ignored** and will not be committed to the repository. Each developer's knowledge base is rebuilt automatically when they run the hub.
 
 ## Assistant Notes
 

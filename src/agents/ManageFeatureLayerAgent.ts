@@ -16,7 +16,6 @@ import {
   getLastCreatedFeatureLayer,
 } from "../utils/assistantState";
 import { searchPortalLayerByName } from "../utils/arcgisOnline";
-import { GEOCODER_URL, MAP_ELEMENT_SELECTOR } from "../utils/arcgisConfig";
 
 const editIntentTool = tool(
   async (args) => JSON.stringify(args),
@@ -76,7 +75,7 @@ function extractLastUserText(state: any): string {
 }
 
 function findLayerUrlByName(name: string): string | null {
-  const mapEl = document.querySelector(MAP_ELEMENT_SELECTOR) as any;
+  const mapEl = document.querySelector("#main-map") as any;
   const layers = mapEl?.view?.map?.allLayers;
   if (!layers) return null;
   const search = name.trim().toLowerCase();
@@ -105,7 +104,7 @@ async function geocodeLocation(location: string): Promise<{
     forStorage: "false",
   });
   try {
-    const resp = await fetch(`${GEOCODER_URL}?${params}`);
+    const resp = await fetch(`https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?${params}`);
     if (!resp.ok) return null;
     const json: any = await resp.json();
     const candidate = json?.candidates?.[0];
@@ -185,9 +184,7 @@ export function registerManageFeatureLayerAgent(assistant: HTMLElement) {
         null;
 
       if (!intent.action) {
-        // No recognisable edit operation — return nothing so this agent's output
-        // doesn't contaminate another agent's valid response in the same turn.
-        return { outputMessage: "" };
+        return { outputMessage: "Please tell me what you'd like to do: add, update, or delete a feature." };
       }
       if (!layerUrl) {
         const hint = intent.layerName
@@ -379,10 +376,7 @@ export function registerManageFeatureLayerAgent(assistant: HTMLElement) {
     id: agentId,
     name: "Manage Feature Layer Features",
     description:
-      "ONLY use this agent when the user explicitly wants to ADD, CREATE, INSERT, UPDATE, EDIT, MODIFY, DELETE, or REMOVE a specific record or feature in an existing hosted feature layer. " +
-      "DO NOT use for: show, find, search, display, list, view, browse, analyze, or any read/query operation that is not directly related to a feautre in the. " +
-      "DO NOT use for MCP server queries, STAC catalog operations, or satellite/imagery data requests. " +
-      "The target layer must be an editable ArcGIS FeatureServer layer — not a STAC collection, imagery service, or read-only layer.",
+      "Adds, updates, or deletes individual features (records/points) in an existing hosted feature layer. Use when the user wants to add a new record or point to a layer, update field values of an existing feature, or delete a feature. Identifies the target layer by name from the map, by URL, or from the most recently created layer. Can geocode place names and addresses — exact coordinates are not required.",
     createGraph,
     workspace: {},
   } as any;

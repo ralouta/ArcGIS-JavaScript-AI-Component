@@ -350,14 +350,10 @@ function statusColor(status: string): string {
 interface Props {
   open: boolean;
   onClose: () => void;
-  /** Called whenever the server list changes (add/remove/start/stop). */
-  onServersChange?: (servers: HubServer[]) => void;
 }
 
-export default function HubServerManager({ open, onClose, onServersChange }: Props) {
+export default function HubServerManager({ open, onClose }: Props) {
   const [servers, setServers] = useState<HubServer[]>([]);
-  const onServersChangeRef = useRef(onServersChange);
-  onServersChangeRef.current = onServersChange;
   const [loading, setLoading] = useState(false);
   const [hubError, setHubError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -389,16 +385,11 @@ export default function HubServerManager({ open, onClose, onServersChange }: Pro
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const applyServers = useCallback((next: HubServer[]) => {
-    setServers(next);
-    onServersChangeRef.current?.(next);
-  }, []);
-
   const load = useCallback(async () => {
     setLoading(true);
     setHubError(null);
     try {
-      applyServers(await fetchServers());
+      setServers(await fetchServers());
     } catch (err: any) {
       setHubError(
         err?.message ?? "Cannot reach MCP Hub. Is it running?",
@@ -406,7 +397,7 @@ export default function HubServerManager({ open, onClose, onServersChange }: Pro
     } finally {
       setLoading(false);
     }
-  }, [applyServers]);
+  }, []);
 
   useEffect(() => {
     if (open) {
@@ -424,8 +415,8 @@ export default function HubServerManager({ open, onClose, onServersChange }: Pro
       const updated = server.enabled
         ? await apiStopServer(server.id)
         : await apiStartServer(server.id);
-      applyServers(
-        servers.map((s) => (s.id === updated.id ? updated : s)),
+      setServers((prev) =>
+        prev.map((s) => (s.id === updated.id ? updated : s)),
       );
     } catch {}
     setBusy(false);
@@ -435,7 +426,7 @@ export default function HubServerManager({ open, onClose, onServersChange }: Pro
     setBusy(true);
     try {
       await apiDeleteServer(id);
-      applyServers(servers.filter((s) => s.id !== id));
+      setServers((prev) => prev.filter((s) => s.id !== id));
     } catch {}
     setBusy(false);
   };
@@ -463,14 +454,16 @@ export default function HubServerManager({ open, onClose, onServersChange }: Pro
     try {
       if (addingNew) {
         const created = await apiAddServer(draftToPayload(draft, true));
-        applyServers([...servers, created]);
+        setServers((prev) => [...prev, created]);
       } else if (editingId) {
         const server = servers.find((s) => s.id === editingId);
         const updated = await apiUpdateServer(
           editingId,
           draftToPayload(draft, server?.enabled ?? true),
         );
-        applyServers(servers.map((s) => (s.id === updated.id ? updated : s)));
+        setServers((prev) =>
+          prev.map((s) => (s.id === updated.id ? updated : s)),
+        );
       }
       cancelEdit();
     } catch {}

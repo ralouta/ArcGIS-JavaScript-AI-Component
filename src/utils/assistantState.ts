@@ -9,11 +9,15 @@ export interface AssistantResultField {
 }
 
 export interface AssistantResultEntity {
-  kind: "point" | "country" | "region";
+  kind: "point" | "country" | "region" | "extent";
   origin: "source" | "context";
   label: string;
   lat?: number;
   lon?: number;
+  west?: number;
+  south?: number;
+  east?: number;
+  north?: number;
   description?: string;
   summary?: string;
   links?: AssistantResultLink[];

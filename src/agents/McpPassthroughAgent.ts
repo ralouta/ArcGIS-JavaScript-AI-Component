@@ -3,13 +3,8 @@ import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { StateGraph, Annotation as ANNOTATION, START, END } from "@langchain/langgraph/web";
 import { z } from "zod";
-import { renderArbitraryGeoJson } from "../utils/mcpArbitraryRenderer";
-import { GEOCODER_URL } from "../utils/arcgisConfig";
-import { synthesizeGeoJson } from "../utils/mcpGeoJsonSynthesizer";
-import { clearMcpGeoLayer, renderMcpGeoEntities, type GeoEntity, type GeoContext, type GeoPoint, type GeoCountry, type GeoRegion } from "../utils/mcpGeoRenderer";
+import { clearMcpGeoLayer, renderMcpGeoEntities, type GeoEntity, type GeoContext, type GeoPoint, type GeoCountry, type GeoRegion, type GeoExtent } from "../utils/mcpGeoRenderer";
 import { setLastAssistantGeoSnapshot } from "../utils/assistantState";
-import { resolveArcgisMcpBaseUrl } from "../utils/arcgisMcp";
-import { searchPortalLayerByName } from "../utils/arcgisOnline";
 
 export interface McpPassthroughAgentContext {
   baseUrl?: string;
@@ -18,6 +13,12 @@ export interface McpPassthroughAgentContext {
 
 interface ToolAliasMap {
   [alias: string]: string;
+}
+
+interface HubServerSummary {
+  id: string;
+  label: string;
+  status?: string;
 }
 
 interface GeoRenderPlanLocation {
@@ -29,26 +30,22 @@ interface GeoRenderPlanLocation {
   description?: string;
 }
 
-interface SynthesizedFeatureLike {
-  title: string;
-  description?: string;
-  geometryType: "Point" | "LineString" | "Polygon" | "MultiPoint" | "MultiLineString" | "MultiPolygon" | "none";
-  coordinates?: unknown;
-  properties: Record<string, unknown>;
-  renderHint: "point" | "line" | "polygon";
-  layerGroup?: string;
-  imageUrl?: string;
-}
-
 let latestGeoRenderToken = 0;
 let pendingGeoRenderTimer: number | null = null;
 let latestMcpRunToken = 0;
 const cancelBoundAssistants = new WeakSet<HTMLElement>();
 const activeMcpAbortControllers = new Set<AbortController>();
+const MCP_DISCOVERY_TIMEOUT_MS = 8_000;
+const MCP_TOOL_CALL_TIMEOUT_MS = 15_000;
+const MCP_NOTIFY_TIMEOUT_MS = 3_000;
+const HUB_SERVERS_TIMEOUT_MS = 4_000;
 
-function beginMcpAbortController(): AbortController {
+function beginMcpAbortController(timeoutMs?: number): AbortController {
   const controller = new AbortController();
   activeMcpAbortControllers.add(controller);
+  if (timeoutMs && timeoutMs > 0) {
+    globalThis.setTimeout(() => controller.abort(`timeout:${timeoutMs}`), timeoutMs);
+  }
   return controller;
 }
 
@@ -71,53 +68,6 @@ function isAbortLikeError(error: unknown): boolean {
   const name = (error as any)?.name;
   const message = String((error as any)?.message ?? "");
   return name === "AbortError" || /abort/i.test(message);
-}
-
-function isPreviewImageUrl(url: string): boolean {
-  return /^https?:\/\/\S+/i.test(url) && /(?:^|[/?#_.-])(thumbnail|preview|overview|render|image)|\.(?:png|jpe?g|gif|webp|bmp|svg)(?:[?#].*)?$/i.test(url);
-}
-
-function extractEntityPreviewImageUrl(entity: GeoEntity): string | undefined {
-  return entity.context?.links?.find((link) => isPreviewImageUrl(link.url))?.url;
-}
-
-function mergeSynthesizedPointEntities(
-  synthesized: { features: SynthesizedFeatureLike[]; hasExplicitGeometry: boolean },
-  entities: GeoEntity[],
-): { features: SynthesizedFeatureLike[]; hasExplicitGeometry: boolean } {
-  const merged = [...synthesized.features];
-  const seen = new Set(
-    merged.map((feature) => {
-      if (feature.geometryType !== "Point" || !Array.isArray(feature.coordinates)) return null;
-      const [lon, lat] = feature.coordinates as [number, number];
-      return `${feature.title.toLowerCase()}|${lat.toFixed(3)}|${lon.toFixed(3)}`;
-    }).filter(Boolean) as string[],
-  );
-
-  for (const entity of entities) {
-    if (entity.kind !== "point") continue;
-    const key = `${entity.label.toLowerCase()}|${entity.lat.toFixed(3)}|${entity.lon.toFixed(3)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push({
-      title: entity.label,
-      description: entity.description,
-      geometryType: "Point",
-      coordinates: [entity.lon, entity.lat],
-      properties: {
-        origin: entity.origin,
-        ...(entity.context?.summary ? { summary: entity.context.summary } : {}),
-        ...(entity.context?.links?.length
-          ? { links: entity.context.links.map((link) => link.url).join(" | ") }
-          : {}),
-      },
-      renderHint: "point",
-      layerGroup: entity.origin === "source" ? "Results" : "Context",
-      imageUrl: extractEntityPreviewImageUrl(entity),
-    });
-  }
-
-  return { ...synthesized, features: merged };
 }
 
 export function cancelPendingMcpGeoRender(): void {
@@ -148,33 +98,6 @@ interface McpToolDef {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
-}
-
-interface KnowledgeBaseToolField {
-  name: string;
-  type?: string;
-  required?: boolean;
-  description?: string;
-}
-
-interface KnowledgeBaseToolRecord {
-  name: string;
-  description?: string;
-  fields?: KnowledgeBaseToolField[];
-  requiredFieldCount?: number;
-}
-
-interface KnowledgeBaseServerRecord {
-  id: string;
-  label: string;
-  status?: string;
-  capabilitySummary?: string[];
-  tools?: KnowledgeBaseToolRecord[];
-}
-
-interface McpKnowledgeBaseDocument {
-  generatedAt?: string;
-  servers?: KnowledgeBaseServerRecord[];
 }
 
 /**
@@ -211,7 +134,10 @@ function resolveFetchUrl(url: string): string {
  * Handles both direct JSON and SSE (text/event-stream) responses.
  */
 async function mcpPost(fetchUrl: string, body: Record<string, unknown>): Promise<unknown> {
-  const controller = beginMcpAbortController();
+  const timeoutMs = typeof body.__timeoutMs === "number" ? Number(body.__timeoutMs) : undefined;
+  const payload = { ...body } as Record<string, unknown>;
+  delete payload.__timeoutMs;
+  const controller = beginMcpAbortController(timeoutMs);
   try {
     const response = await fetch(fetchUrl, {
       method: "POST",
@@ -219,7 +145,7 @@ async function mcpPost(fetchUrl: string, body: Record<string, unknown>): Promise
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
 
@@ -249,21 +175,26 @@ async function mcpPost(fetchUrl: string, body: Record<string, unknown>): Promise
     const json: any = await response.json();
     if (json.error) throw new Error(String(json.error.message ?? "MCP RPC error"));
     return json.result;
+  } catch (error) {
+    if (isAbortLikeError(error) && timeoutMs) {
+      throw new Error(`MCP request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+    }
+    throw error;
   } finally {
     endMcpAbortController(controller);
   }
 }
 
 /** Send a JSON-RPC 2.0 request to the endpoint URL provided by the user. */
-function mcpRequest(endpointUrl: string, method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+function mcpRequest(endpointUrl: string, method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<unknown> {
   const url = resolveFetchUrl(normalizeUrl(endpointUrl));
-  return mcpPost(url, { jsonrpc: "2.0", id: 1, method, params });
+  return mcpPost(url, { jsonrpc: "2.0", id: 1, method, params, __timeoutMs: timeoutMs });
 }
 
 /** Fire-and-forget JSON-RPC 2.0 notification (no id). */
 async function mcpNotify(endpointUrl: string, method: string, params: Record<string, unknown> = {}): Promise<void> {
   const url = resolveFetchUrl(normalizeUrl(endpointUrl));
-  const controller = beginMcpAbortController();
+  const controller = beginMcpAbortController(MCP_NOTIFY_TIMEOUT_MS);
   await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -281,154 +212,9 @@ const initializedEndpoints = new Set<string>();
 
 /** Cached tool definitions per endpoint URL (short-lived to avoid stale names). */
 const mcpToolsCache = new Map<string, { tools: McpToolDef[]; at: number }>();
-const TOOL_CACHE_TTL_MS = 10_000;
-const knowledgeBaseCache = new Map<string, { document: McpKnowledgeBaseDocument | null; at: number }>();
-const KNOWLEDGE_BASE_CACHE_TTL_MS = 10_000;
-
-function resolveKnowledgeBaseUrl(endpointUrl: string): string {
-  const normalized = normalizeUrl(endpointUrl);
-  if (/^https?:\/\//i.test(normalized)) {
-    try {
-      const url = new URL(normalized);
-      url.pathname = url.pathname.replace(/\/?mcp\/?$/i, "") || "/";
-      url.pathname = `${url.pathname.replace(/\/+$/, "") || ""}/knowledge-base`;
-      url.search = "";
-      return url.toString();
-    } catch {
-      return `${normalized.replace(/\/+$/, "")}/knowledge-base`;
-    }
-  }
-  return `${normalized.replace(/\/+$/, "")}/knowledge-base`;
-}
-
-async function fetchMcpKnowledgeBase(endpointUrl: string): Promise<McpKnowledgeBaseDocument | null> {
-  const key = normalizeUrl(endpointUrl);
-  const cached = knowledgeBaseCache.get(key);
-  if (cached && Date.now() - cached.at < KNOWLEDGE_BASE_CACHE_TTL_MS) {
-    return cached.document;
-  }
-
-  const fetchUrl = resolveFetchUrl(resolveKnowledgeBaseUrl(endpointUrl));
-  const controller = beginMcpAbortController();
-  try {
-    const response = await fetch(fetchUrl, {
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      knowledgeBaseCache.set(key, { document: null, at: Date.now() });
-      return null;
-    }
-    const document = (await response.json()) as McpKnowledgeBaseDocument;
-    knowledgeBaseCache.set(key, { document, at: Date.now() });
-    return document;
-  } catch {
-    knowledgeBaseCache.set(key, { document: null, at: Date.now() });
-    return null;
-  } finally {
-    endMcpAbortController(controller);
-  }
-}
-
-function selectKnowledgeBaseServers(
-  document: McpKnowledgeBaseDocument | null,
-  tools: McpToolDef[],
-): KnowledgeBaseServerRecord[] {
-  const servers = Array.isArray(document?.servers) ? document!.servers! : [];
-  if (!servers.length) return [];
-
-  const prefixedServerIds = new Set(
-    tools
-      .map((tool) => {
-        const match = tool.name.match(/^([^_]+(?:-[^_]+)*)__/);
-        return match?.[1] ?? null;
-      })
-      .filter((value): value is string => Boolean(value)),
-  );
-
-  if (prefixedServerIds.size) {
-    return servers.filter((server) => prefixedServerIds.has(server.id));
-  }
-
-  if (servers.length === 1) return servers;
-  return servers.filter((server) => server.status === "running" && (server.tools?.length ?? 0) > 0);
-}
-
-function truncateSentence(value: string, maxLength: number): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
-}
-
-function escapePromptTemplateText(value: string): string {
-  return value.replace(/\{/g, "{{").replace(/\}/g, "}}");
-}
-
-function buildKnowledgeBaseDescriptionSupplement(
-  document: McpKnowledgeBaseDocument | null,
-  tools: McpToolDef[],
-): string {
-  const servers = selectKnowledgeBaseServers(document, tools);
-  if (!servers.length) return "";
-
-  const lines: string[] = ["", "Persisted MCP capability notes:"];
-  for (const server of servers.slice(0, 4)) {
-    const summaries = (server.capabilitySummary ?? []).filter(Boolean).slice(0, 2);
-    if (summaries.length) {
-      lines.push(`- ${server.label}: ${summaries.map((summary) => truncateSentence(summary, 160)).join(" | ")}`);
-      continue;
-    }
-
-    const toolHints = (server.tools ?? [])
-      .slice(0, 3)
-      .map((tool) => {
-        const requiredFields = (tool.fields ?? []).filter((field) => field.required).map((field) => field.name);
-        return requiredFields.length
-          ? `${tool.name} (requires: ${requiredFields.join(", ")})`
-          : tool.name;
-      });
-    if (toolHints.length) {
-      lines.push(`- ${server.label}: ${toolHints.join("; ")}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
-function buildKnowledgeBasePromptSupplement(
-  document: McpKnowledgeBaseDocument | null,
-  tools: McpToolDef[],
-): string {
-  const servers = selectKnowledgeBaseServers(document, tools);
-  if (!servers.length) return "";
-
-  const sections: string[] = [
-    "",
-    "KNOWLEDGE-BASE GUIDANCE:",
-    "- Use the persisted MCP capability notes below as prior knowledge about what the connected server can discover.",
-    "- If a documented search, list, browse, lookup, or discovery tool exists, use it before asking the user for opaque internal identifiers.",
-    "- Preserve concrete user constraints like place, year, output format, and scope while you use discovery tools to resolve missing internal IDs or provider-specific parameters.",
-    "- Ask a clarification question only after you have tried the documented discovery path and still cannot disambiguate the request.",
-  ];
-
-  for (const server of servers.slice(0, 4)) {
-    sections.push(`- Server ${server.label}:`);
-    const summaries = (server.capabilitySummary ?? []).filter(Boolean).slice(0, 3);
-    for (const summary of summaries) {
-      sections.push(`  ${truncateSentence(summary, 220)}`);
-    }
-
-    const toolLines = (server.tools ?? []).slice(0, 6).map((tool) => {
-      const requiredFields = (tool.fields ?? []).filter((field) => field.required).map((field) => field.name);
-      const fieldHint = requiredFields.length ? ` required=${requiredFields.join(",")}` : "";
-      const description = tool.description ? ` ${truncateSentence(tool.description, 180)}` : "";
-      return `  - ${tool.name}${fieldHint}${description}`;
-    });
-    sections.push(...toolLines);
-  }
-
-  return escapePromptTemplateText(sections.join("\n"));
-}
+const TOOL_CACHE_TTL_MS = 300_000;
+const hubServersCache = new Map<string, { servers: HubServerSummary[]; at: number }>();
+const HUB_SERVERS_CACHE_TTL_MS = 60_000;
 
 /**
  * Run the MCP initialize → notifications/initialized handshake once per URL.
@@ -441,7 +227,7 @@ async function ensureInitialized(endpointUrl: string): Promise<void> {
     protocolVersion: "2024-11-05",
     capabilities: { tools: {} },
     clientInfo: { name: "mcp-passthrough-agent", version: "1.0.0" },
-  });
+  }, MCP_DISCOVERY_TIMEOUT_MS);
   await mcpNotify(endpointUrl, "notifications/initialized");
   initializedEndpoints.add(key);
 }
@@ -451,7 +237,6 @@ function clearMcpCaches(endpointUrl: string): void {
   const key = normalizeUrl(endpointUrl);
   initializedEndpoints.delete(key);
   mcpToolsCache.delete(key);
-  knowledgeBaseCache.delete(key);
 }
 
 /** Discover tools from the MCP server. Cached after first call. */
@@ -462,7 +247,7 @@ async function listMcpTools(endpointUrl: string): Promise<McpToolDef[]> {
     return cached.tools;
   }
   await ensureInitialized(endpointUrl);
-  const result: any = await mcpRequest(endpointUrl, "tools/list");
+  const result: any = await mcpRequest(endpointUrl, "tools/list", {}, MCP_DISCOVERY_TIMEOUT_MS);
   const tools: McpToolDef[] = Array.isArray(result?.tools) ? result.tools : [];
   mcpToolsCache.set(key, { tools, at: Date.now() });
   return tools;
@@ -471,7 +256,7 @@ async function listMcpTools(endpointUrl: string): Promise<McpToolDef[]> {
 /** Call a specific tool on the MCP server. */
 async function callMcpTool(endpointUrl: string, name: string, args: Record<string, unknown>): Promise<string> {
   await ensureInitialized(endpointUrl);
-  const result: any = await mcpRequest(endpointUrl, "tools/call", { name, arguments: args });
+  const result: any = await mcpRequest(endpointUrl, "tools/call", { name, arguments: args }, MCP_TOOL_CALL_TIMEOUT_MS);
   if (result?.isError) {
     return `Tool returned an error: ${extractText(result.content) || "Unknown tool error."}`;
   }
@@ -498,43 +283,319 @@ function extractText(content: unknown): string {
 // ── JSON Schema → Zod (best-effort for common shapes) ────────────────────────
 
 function jsonPropToZod(prop: Record<string, unknown>, isRequired: boolean): z.ZodTypeAny {
-  const type = prop.type as string | undefined;
-  const desc = typeof prop.description === "string" ? prop.description : undefined;
-
-  let schema: z.ZodTypeAny;
-  switch (type) {
-    case "integer":
-    case "number":
-      schema = z.number();
-      break;
-    case "boolean":
-      schema = z.boolean();
-      break;
-    case "array":
-      schema = z.array(z.unknown());
-      break;
-    case "object":
-      schema = z.record(z.string(), z.unknown());
-      break;
-    default:
-      schema = z.string();
-  }
-
-  if (desc) schema = schema.describe(desc);
-  if (!isRequired) schema = schema.optional();
-  return schema;
+  return schemaToZod(prop, isRequired);
 }
 
 function inputSchemaToZod(inputSchema?: Record<string, unknown>): z.ZodTypeAny {
-  if (!inputSchema || inputSchema.type !== "object") return z.record(z.string(), z.unknown());
-  const properties = inputSchema.properties as Record<string, Record<string, unknown>> | undefined;
-  if (!properties || !Object.keys(properties).length) return z.object({});
-  const required = Array.isArray(inputSchema.required) ? (inputSchema.required as string[]) : [];
-  const shape: Record<string, z.ZodTypeAny> = {};
-  for (const [key, prop] of Object.entries(properties)) {
-    shape[key] = jsonPropToZod(prop, required.includes(key));
+  if (!inputSchema) {
+    return z.object({
+      __no_args: z.boolean().optional().describe("This tool takes no arguments. Leave unset."),
+    });
   }
-  return z.object(shape);
+
+  if (requiresRootSchemaWrapper(inputSchema)) {
+    return buildWrappedRootSchema(inputSchema);
+  }
+
+  return schemaToZod(inputSchema, true);
+}
+
+function rootSchemaHasExplicitProperties(inputSchema?: Record<string, unknown>): boolean {
+  const properties = inputSchema?.properties;
+  return Boolean(properties && typeof properties === "object" && !Array.isArray(properties) && Object.keys(properties).length > 0);
+}
+
+function requiresRootSchemaWrapper(inputSchema?: Record<string, unknown>): boolean {
+  if (!inputSchema) return true;
+
+  const rawType = inputSchema.type;
+  const types = Array.isArray(rawType) ? rawType.map(String) : typeof rawType === "string" ? [rawType] : [];
+  const nonNullTypes = types.filter((type) => type !== "null");
+
+  if (nonNullTypes.length > 1) return true;
+
+  const schemaType = nonNullTypes[0];
+  if (!schemaType || schemaType === "object") {
+    return !rootSchemaHasExplicitProperties(inputSchema);
+  }
+
+  return true;
+}
+
+function buildWrappedRootSchema(inputSchema?: Record<string, unknown>): z.ZodTypeAny {
+  const desc = truncateDescription(typeof inputSchema?.description === "string" ? inputSchema.description : undefined, 180);
+  const takesNoArgs = !inputSchema || (!rootSchemaHasExplicitProperties(inputSchema) && inputSchema.additionalProperties == null);
+
+  const wrapped = takesNoArgs
+    ? z.object({
+        __no_args: z.boolean().optional().describe("This tool takes no arguments. Leave unset."),
+      })
+    : z.object({
+        __raw_args_json: z.string().optional().describe("JSON object string containing the MCP tool arguments."),
+      });
+
+  return desc ? wrapped.describe(desc) : wrapped;
+}
+
+function normalizeToolArgsForCall(
+  inputSchema: Record<string, unknown> | undefined,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!requiresRootSchemaWrapper(inputSchema)) {
+    return args;
+  }
+
+  const rawJson = typeof args.__raw_args_json === "string" ? args.__raw_args_json.trim() : "";
+  if (rawJson) {
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Fall through to empty args when the wrapper content is invalid.
+    }
+  }
+
+  return {};
+}
+
+function truncateDescription(text: string | undefined, maxLength = 220): string | undefined {
+  const normalized = text?.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function enumToSchema(values: unknown[]): z.ZodTypeAny | null {
+  if (!values.length) return null;
+  if (values.every((value) => typeof value === "string")) {
+    const unique = [...new Set(values as string[])];
+    if (!unique.length) return null;
+    return unique.length === 1 ? z.literal(unique[0]) : z.enum(unique as [string, ...string[]]);
+  }
+
+  const literals = values
+    .filter((value) => ["string", "number", "boolean"].includes(typeof value))
+    .map((value) => z.literal(value as string | number | boolean));
+  if (!literals.length) return null;
+  if (literals.length === 1) return literals[0];
+  if (literals.length === 2) return z.union([literals[0], literals[1]]);
+  return z.union([literals[0], literals[1], ...literals.slice(2)] as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]);
+}
+
+function unionSchemas(parts: z.ZodTypeAny[]): z.ZodTypeAny {
+  const unique = parts.filter(Boolean);
+  if (!unique.length) return z.unknown();
+  if (unique.length === 1) return unique[0];
+  if (unique.length === 2) return z.union([unique[0], unique[1]]);
+  return z.union([unique[0], unique[1], ...unique.slice(2)] as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]);
+}
+
+function schemaToZod(schemaLike: unknown, isRequired: boolean): z.ZodTypeAny {
+  const schema = schemaLike && typeof schemaLike === "object" && !Array.isArray(schemaLike)
+    ? schemaLike as Record<string, unknown>
+    : {};
+  const desc = truncateDescription(typeof schema.description === "string" ? schema.description : undefined, 180);
+
+  let nullable = false;
+
+  const variants = ["anyOf", "oneOf"]
+    .flatMap((key) => Array.isArray(schema[key]) ? [schema[key] as unknown[]] : [])
+    .flat();
+  if (variants.length) {
+    const variantSchemas = variants.flatMap((variant) => {
+      const variantRecord = variant && typeof variant === "object" && !Array.isArray(variant)
+        ? variant as Record<string, unknown>
+        : null;
+      const variantType = variantRecord?.type;
+      if (variantType === "null") {
+        nullable = true;
+        return [];
+      }
+      return [schemaToZod(variant, true)];
+    });
+    let union = unionSchemas(variantSchemas);
+    if (nullable) union = union.nullable();
+    if (desc) union = union.describe(desc);
+    if (!isRequired) union = union.optional();
+    return union;
+  }
+
+  const enumSchema = Array.isArray(schema.enum) ? enumToSchema(schema.enum) : null;
+  if (enumSchema) {
+    let out = enumSchema;
+    if (desc) out = out.describe(desc);
+    if (!isRequired) out = out.optional();
+    return out;
+  }
+
+  const rawType = schema.type;
+  const types = Array.isArray(rawType) ? rawType.map(String) : typeof rawType === "string" ? [rawType] : [];
+  const nonNullTypes = types.filter((type) => type !== "null");
+  if (types.includes("null")) nullable = true;
+
+  let out: z.ZodTypeAny;
+  if (nonNullTypes.length > 1) {
+    out = unionSchemas(nonNullTypes.map((type) => schemaToZod({ ...schema, type }, true)));
+  } else {
+    const type = nonNullTypes[0];
+    switch (type) {
+      case "integer":
+        out = z.number().int();
+        break;
+      case "number":
+        out = z.number();
+        break;
+      case "boolean":
+        out = z.boolean();
+        break;
+      case "array": {
+        const itemSchema = schema.items ? schemaToZod(schema.items, true) : z.unknown();
+        out = z.array(itemSchema);
+        break;
+      }
+      case "object": {
+        const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+          ? schema.properties as Record<string, Record<string, unknown>>
+          : undefined;
+        const required = Array.isArray(schema.required) ? schema.required.map(String) : [];
+        if (properties && Object.keys(properties).length) {
+          const shape: Record<string, z.ZodTypeAny> = {};
+          for (const [key, prop] of Object.entries(properties)) {
+            shape[key] = jsonPropToZod(prop, required.includes(key));
+          }
+          let objectSchema = z.object(shape);
+          if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+            objectSchema = objectSchema.catchall(schemaToZod(schema.additionalProperties, true));
+          } else if (schema.additionalProperties !== true) {
+            objectSchema = objectSchema.strict();
+          }
+          out = objectSchema;
+        } else if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+          out = z.record(z.string(), schemaToZod(schema.additionalProperties, true));
+        } else {
+          out = z.record(z.string(), z.unknown());
+        }
+        break;
+      }
+      case "string":
+      default:
+        out = z.string();
+        break;
+    }
+  }
+
+  if (nullable) out = out.nullable();
+  if (desc) out = out.describe(desc);
+  if (!isRequired) out = out.optional();
+  return out;
+}
+
+function parseQualifiedToolName(name: string): { serverId: string | null; toolName: string } {
+  const idx = name.indexOf("__");
+  if (idx < 0) return { serverId: null, toolName: name };
+  return {
+    serverId: name.slice(0, idx),
+    toolName: name.slice(idx + 2),
+  };
+}
+
+function resolveHubServersUrl(endpointUrl: string): string | null {
+  const normalized = normalizeUrl(endpointUrl);
+  if (!normalized) return null;
+  if (/^https?:\/\//i.test(normalized)) {
+    try {
+      const url = new URL(normalized);
+      if (/\/mcp\/?$/i.test(url.pathname)) {
+        url.pathname = `${url.pathname.replace(/\/+$/, "")}/servers`;
+      } else {
+        url.pathname = `${url.pathname.replace(/\/+$/, "") || ""}/servers`;
+      }
+      url.search = "";
+      return url.toString();
+    } catch {
+      return null;
+    }
+  }
+  if (/\/mcp\/?$/i.test(normalized)) {
+    return `${normalized.replace(/\/+$/, "")}/servers`;
+  }
+  return null;
+}
+
+async function listHubServers(endpointUrl: string): Promise<HubServerSummary[]> {
+  const cacheKey = normalizeUrl(endpointUrl);
+  const cached = hubServersCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < HUB_SERVERS_CACHE_TTL_MS) {
+    return cached.servers;
+  }
+
+  const serversUrl = resolveHubServersUrl(endpointUrl);
+  if (!serversUrl) return [];
+
+  const controller = beginMcpAbortController(HUB_SERVERS_TIMEOUT_MS);
+  try {
+    const response = await fetch(resolveFetchUrl(serversUrl), {
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) return [];
+    const json: any = await response.json();
+    const servers = Array.isArray(json?.servers)
+      ? json.servers.map((server: any) => ({ id: String(server.id ?? ""), label: String(server.label ?? server.id ?? ""), status: server.status ? String(server.status) : undefined }))
+      : [];
+    hubServersCache.set(cacheKey, { servers, at: Date.now() });
+    return servers;
+  } catch {
+    return [];
+  } finally {
+    endMcpAbortController(controller);
+  }
+}
+
+function summarizeToolDescription(def: McpToolDef, serverLabel?: string): string {
+  const { toolName } = parseQualifiedToolName(def.name);
+  const summary = truncateDescription(def.description, 240) || `Tool: ${toolName}`;
+  return serverLabel
+    ? `[Server: ${serverLabel}] ${summary} (MCP tool: ${toolName})`
+    : `${summary} (MCP tool: ${toolName})`;
+}
+
+const MCP_ROUTING_BASE_DESCRIPTION =
+  "Primary agent for external, non-map questions that need MCP tools or live data sources. " +
+  "Use this for census, population, demographics, statistics, rankings, current facts, external catalog searches, STAC catalogs, metadata lookups, collection browsing, and latest-item queries. " +
+  "Prefer this agent whenever the answer is not already visible in the active map layers or current web map.";
+
+function buildDescriptionFromTools(
+  tools: McpToolDef[],
+  serverName: string,
+  hubServers: HubServerSummary[] = [],
+): string {
+  if (!tools.length) {
+    return `${MCP_ROUTING_BASE_DESCRIPTION} Connected server: ${serverName}.`;
+  }
+
+  const serverLabels = new Map(hubServers.map((server) => [server.id, server.label]));
+  const summarizedTools = tools.slice(0, 18).map((toolDef) => {
+    const { serverId, toolName } = parseQualifiedToolName(toolDef.name);
+    const toolServerLabel = serverId ? (serverLabels.get(serverId) || serverId) : serverName;
+    const summary = truncateDescription(toolDef.description, 140) || `Tool for ${toolName.replace(/[_-]+/g, " ")}`;
+    return `${toolServerLabel}: ${toolName} - ${summary}`;
+  });
+
+  const serverSummary = hubServers.length
+    ? `Connected MCP sources: ${hubServers.map((server) => server.label).join(", ")}.`
+    : `Connected MCP source: ${serverName}.`;
+
+  return [
+    MCP_ROUTING_BASE_DESCRIPTION,
+    serverSummary,
+    "Relevant examples include questions like top U.S. cities by population, Census data lookups, demographic comparisons, external API facts, and catalog/item searches.",
+    "Available MCP tool coverage:",
+    ...summarizedTools.map((line) => `- ${line}`),
+    tools.length > summarizedTools.length ? `- ...and ${tools.length - summarizedTools.length} more MCP tools.` : "",
+  ].filter(Boolean).join("\n");
 }
 
 // ── LangGraph helpers ─────────────────────────────────────────────────────────
@@ -567,6 +628,109 @@ function contentToText(content: unknown): string {
       .trim();
   }
   return "";
+}
+
+function extractLastUserText(messages: any[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (!message) continue;
+
+    const isHuman =
+      HumanMessage.isInstance(message) ||
+      message.getType?.() === "human" ||
+      message.lc_kwargs?.type === "human" ||
+      message.kwargs?.type === "human" ||
+      message.role === "user";
+    if (!isHuman) continue;
+
+    if (typeof message.lc_kwargs?.content === "string" && message.lc_kwargs.content.trim()) return message.lc_kwargs.content.trim();
+    if (typeof message.kwargs?.content === "string" && message.kwargs.content.trim()) return message.kwargs.content.trim();
+    if (typeof message.content === "string" && message.content.trim()) return message.content.trim();
+  }
+  return "";
+}
+
+function rankMcpToolsForQuery(
+  toolDefs: McpToolDef[],
+  queryText: string,
+  serverLabels: Map<string, string>,
+): McpToolDef[] {
+  const query = queryText.toLowerCase();
+  const hasQuery = Boolean(query.trim());
+  const includesAny = (patterns: RegExp[]) => patterns.some((pattern) => pattern.test(query));
+
+  const topicWeights: Array<{ patterns: RegExp[]; weight: number; keywords: RegExp[] }> = [
+    {
+      patterns: [/\bcensus\b/, /\bpopulation\b/, /\bdemograph/i, /\bcities?\b/, /\busa\b|\bu\.s\.\b|\bunited states\b/],
+      weight: 12,
+      keywords: [/census/i, /population/i, /demograph/i, /city|cities/i, /geograph/i],
+    },
+    {
+      patterns: [/\bstac\b/, /asset catalog/i, /\bcollection\b/, /imagery/i, /satellite/i],
+      weight: 12,
+      keywords: [/stac/i, /catalog/i, /collection/i, /imagery/i, /satellite/i],
+    },
+    {
+      patterns: [/\bweather\b/, /forecast/i, /temperature/i, /air quality/i, /aqi/i],
+      weight: 12,
+      keywords: [/weather/i, /forecast/i, /temperature/i, /air quality|aqi/i],
+    },
+    {
+      patterns: [/\bnews\b/, /headline/i, /article/i],
+      weight: 12,
+      keywords: [/news/i, /headline/i, /article/i],
+    },
+    {
+      patterns: [/\bsdmx\b/, /dataflow/i, /indicator/i, /statistics/i, /dataset/i],
+      weight: 6,
+      keywords: [/sdmx/i, /dataflow/i, /indicator/i, /dataset/i, /statistic/i],
+    },
+  ];
+
+  const scored = toolDefs.map((toolDef, index) => {
+    const { serverId, toolName } = parseQualifiedToolName(toolDef.name);
+    const serverLabel = (serverId ? (serverLabels.get(serverId) || serverId) : "").toLowerCase();
+    const haystack = [toolDef.name, toolName, toolDef.description ?? "", serverLabel].join(" ").toLowerCase();
+
+    let score = 0;
+    if (!hasQuery) score += 1;
+
+    for (const topic of topicWeights) {
+      if (!includesAny(topic.patterns)) continue;
+      if (topic.keywords.some((pattern) => pattern.test(haystack))) {
+        score += topic.weight;
+      }
+    }
+
+    if (/\bcurrent\b|\blatest\b|\btop\b|\brank/i.test(query) && /fetch|search|list|get/i.test(haystack)) {
+      score += 2;
+    }
+    if (/\bcensus\b|\bpopulation\b|\bdemograph/i.test(query) && /news|weather|stac/i.test(haystack)) {
+      score -= 8;
+    }
+    if (/\bstac\b|catalog|imagery|satellite/i.test(query) && /census|weather|news|sdmx/i.test(haystack)) {
+      score -= 8;
+    }
+    if (/\bweather\b|forecast|temperature|aqi/i.test(query) && /census|news|stac|sdmx/i.test(haystack)) {
+      score -= 8;
+    }
+    if (/\bnews\b|headline|article/i.test(query) && /census|weather|stac|sdmx/i.test(haystack)) {
+      score -= 8;
+    }
+    if (serverLabel && query.includes(serverLabel)) {
+      score += 10;
+    }
+
+    return { toolDef, score, index };
+  });
+
+  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  const positive = scored.filter((entry) => entry.score > 0).map((entry) => entry.toolDef);
+  if (positive.length) {
+    return positive.slice(0, 10);
+  }
+
+  return toolDefs.slice(0, 10);
 }
 
 function makeSafeToolAlias(index: number): string {
@@ -688,7 +852,8 @@ function collectGeoHintsFromText(
   for (const section of sections) {
     const heading = section.match(/^##\s+(.+)$/m)?.[1]?.trim();
     const fullName = section.match(/\*\*Full Name:\*\*\s*(.+)$/m)?.[1]?.trim();
-    const locationLine = section.match(/\*\*Location:\*\*\s*(.+)$/m)?.[1]?.trim();
+    const locationLine = section.match(/(?:\*\*Location:\*\*|(?:^|\n)location:)\s*(.+)$/im)?.[1]?.trim();
+    const placeLine = section.match(/(?:^|\n)(?:place|city|country|region|state|province|name|title):\s*(.+)$/im)?.[1]?.trim();
     const label = fullName || heading || locationLine;
 
     const latLonMatch = section.match(/Latitude:\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*Longitude:\s*(-?\d{1,3}(?:\.\d+)?)/i);
@@ -718,13 +883,53 @@ function collectGeoHintsFromText(
       }
     }
 
-    const candidateNames = [fullName, heading, locationLine].filter(
+    const plainLocationCoordMatch = section.match(/(?:^|\n)location:\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)/im);
+    if (plainLocationCoordMatch) {
+      const lat = Number(plainLocationCoordMatch[1]);
+      const lon = Number(plainLocationCoordMatch[2]);
+      if (!isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+        out.coords.push({ lat, lon, label: locationLine || placeLine || heading });
+      }
+    }
+
+    const candidateNames = [fullName, heading, locationLine, placeLine].filter(
       (value): value is string => Boolean(value && value.trim()),
     );
     for (const candidate of candidateNames) {
       if (candidate.length >= 2 && candidate.length <= 120) out.names.push(candidate);
     }
   }
+
+}
+
+function extractCatalogItemBlocks(text: string): string[] {
+  const startRe = /^(?!\s*(?:datetime|bbox|thumbnail|data(?:\s*\(cog\))?|item\s+json|next\s+steps)\b)(.+?\(collection:\s*[^)]+\))\s*$/gim;
+  const matches = [...text.matchAll(startRe)];
+  if (!matches.length) {
+    return text.split(/\n(?=\d+\)\s)/g).map((section) => section.trim()).filter(Boolean);
+  }
+
+  const blocks: string[] = [];
+  for (let index = 0; index < matches.length; index += 1) {
+    const start = matches[index].index ?? 0;
+    const end = matches[index + 1]?.index ?? text.length;
+    const block = text.slice(start, end).trim();
+    if (block) blocks.push(block);
+  }
+
+  return blocks;
+}
+
+function deriveCatalogItemLabel(block: string): string | null {
+  const firstLine = block.split(/\n+/)[0]?.trim();
+  if (firstLine && !/:\s*$/.test(firstLine)) {
+    return firstLine.replace(/\s*\(collection:\s*[^)]+\)\s*$/i, "").trim();
+  }
+
+  const idLabel = block.match(/(?:^|\n)-?\s*ID:\s*(.+)$/im)?.[1]?.trim();
+  const titleLabel = block.match(/(?:^|\n)-?\s*Title:\s*(.+)$/im)?.[1]?.trim();
+  const collectionLabel = block.match(/(?:^|\n)-?\s*Collection:\s*(.+)$/im)?.[1]?.trim();
+  return idLabel || titleLabel || collectionLabel || null;
 }
 
 function normalizeCountryName(raw: string): string | null {
@@ -732,8 +937,23 @@ function normalizeCountryName(raw: string): string | null {
   return KNOWN_COUNTRIES.find((country) => country.toLowerCase() === name) ?? null;
 }
 
+function pointLabelQuality(label: string): number {
+  const trimmed = label.trim();
+  if (!trimmed) return 0;
+  if (/^-?\d{1,3}(?:\.\d+)?(?:°)?\s*,\s*-?\d{1,3}(?:\.\d+)?(?:°)?$/.test(trimmed)) return 1;
+  if (/^-?\d/.test(trimmed)) return 2;
+  if (/,/.test(trimmed)) return 4;
+  return 3;
+}
+
+function choosePreferredPointEntity(current: GeoPoint, candidate: GeoPoint): GeoPoint {
+  const currentScore = pointLabelQuality(current.label) + (current.context ? 2 : 0);
+  const candidateScore = pointLabelQuality(candidate.label) + (candidate.context ? 2 : 0);
+  return candidateScore > currentScore ? candidate : current;
+}
+
 function dedupeGeoEntities(entities: GeoEntity[]): GeoEntity[] {
-  const seen = new Set<string>();
+  const seen = new Map<string, number>();
   const out: GeoEntity[] = [];
 
   for (const entity of entities) {
@@ -742,15 +962,30 @@ function dedupeGeoEntities(entities: GeoEntity[]): GeoEntity[] {
       key = [
         entity.origin,
         entity.kind,
-        entity.label.trim().toLowerCase(),
         entity.lat.toFixed(3),
         entity.lon.toFixed(3),
+      ].join(":");
+    } else if (entity.kind === "extent") {
+      key = [
+        entity.origin,
+        entity.kind,
+        entity.label.trim().toLowerCase(),
+        entity.west.toFixed(3),
+        entity.south.toFixed(3),
+        entity.east.toFixed(3),
+        entity.north.toFixed(3),
       ].join(":");
     } else {
       key = [entity.origin, entity.kind, entity.name.trim().toLowerCase()].join(":");
     }
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const existingIndex = seen.get(key);
+    if (existingIndex != null) {
+      if (entity.kind === "point" && out[existingIndex]?.kind === "point") {
+        out[existingIndex] = choosePreferredPointEntity(out[existingIndex] as GeoPoint, entity as GeoPoint);
+      }
+      continue;
+    }
+    seen.set(key, out.length);
     out.push(entity);
   }
 
@@ -762,14 +997,18 @@ function enrichGeoEntityContext(entities: GeoEntity[], corpus: string): GeoEntit
   const allEntityNames = deduped.map((entity) =>
     entity.kind === "point"
       ? (entity as GeoPoint).label
-      : (entity as GeoCountry | GeoRegion).name,
+      : entity.kind === "extent"
+        ? (entity as GeoExtent).label
+        : (entity as GeoCountry | GeoRegion).name,
   );
 
   for (const entity of deduped) {
     if (entity.context) continue;
     const term = entity.kind === "point"
       ? (entity as GeoPoint).label
-      : (entity as GeoCountry | GeoRegion).name;
+      : entity.kind === "extent"
+        ? (entity as GeoExtent).label
+        : (entity as GeoCountry | GeoRegion).name;
     entity.context = extractEntityContext(corpus, term, allEntityNames);
   }
 
@@ -842,129 +1081,17 @@ async function deriveGeoRenderPlan(
   mcpToolArgs: Record<string, unknown>[],
   toolOutputTexts: string[] = [],
 ): Promise<GeoRenderPlanLocation[]> {
-  const plannerTool = tool(
-    async (args: any) => JSON.stringify(args),
-    {
-      name: "submit_geo_render_plan",
-      description: "Submit the geographic render plan for the response. Return only the locations that should appear on the map.",
-      schema: z.object({
-        locations: z.array(
-          z.object({
-            label: z.string().min(1),
-            kind: z.enum(["point", "country", "region"]),
-            origin: z.enum(["source", "context"]),
-            lat: z.number().optional(),
-            lon: z.number().optional(),
-            description: z.string().optional(),
-          }),
-        ).default([]),
-      }),
-    },
-  );
-
-  const planningPrompt = [
-    "Create a map render plan for the ArcGIS app.",
-    "Decide dynamically which geometries should be shown based on the response and tool outputs.",
-    "Rules:",
-    "- Prefer point for specific places, sites, catalogs, incidents, cities, states, or single-location datasets.",
-    "- Prefer country only for country-scale results.",
-    "- Prefer region only for broad regional extents.",
-    "- Use origin=source when the location is directly supported by tool arguments or tool output.",
-    "- Use origin=context when the assistant narrative adds a place that is not explicit in source coordinates/data.",
-    "- Do not invent locations.",
-    "- Do not create duplicate entries for the same place unless they are meaningfully different geometries.",
-    "- For asset catalogs, weather, fire, or similar place-centric responses, usually return a point instead of only a polygon.",
-    "Call submit_geo_render_plan exactly once.",
-    "",
-    "Assistant response:",
-    text,
-    "",
-    "Tool arguments JSON:",
-    JSON.stringify(mcpToolArgs, null, 2),
-    "",
-    "Tool outputs:",
-    toolOutputTexts.join("\n\n---\n\n"),
-  ].join("\n");
-
-  try {
-    const response = await invokeToolPrompt({
-      promptText: "You are a map-orchestration planner that converts tool results into the right map geometry plan.",
-      messages: [new HumanMessage(planningPrompt)],
-      tools: [plannerTool],
-      temperature: 0,
-    });
-
-    const toolCalls = Array.isArray((response as any)?.tool_calls) ? (response as any).tool_calls : [];
-    const call = toolCalls.find((toolCall: any) => toolCall?.name === "submit_geo_render_plan");
-    const locations = Array.isArray(call?.args?.locations) ? call.args.locations : [];
-    return locations.filter((location: any) =>
-      location &&
-      typeof location.label === "string" &&
-      ["point", "country", "region"].includes(location.kind) &&
-      ["source", "context"].includes(location.origin),
-    );
-  } catch {
-    return [];
-  }
+  void text;
+  void mcpToolArgs;
+  void toolOutputTexts;
+  return [];
 }
 
 async function planLocationsToGeoEntities(
   locations: GeoRenderPlanLocation[],
 ): Promise<GeoEntity[]> {
-  const entities: GeoEntity[] = [];
-
-  for (const location of locations) {
-    if (location.kind === "country") {
-      const country = normalizeCountryName(location.label);
-      if (country) {
-        entities.push({
-          kind: "country",
-          origin: location.origin,
-          name: country,
-          description: location.description,
-        });
-      }
-      continue;
-    }
-
-    if (location.kind === "region") {
-      entities.push({
-        kind: "region",
-        origin: location.origin,
-        name: REGION_TEXT_ALIASES[location.label.trim().toLowerCase()] ?? location.label.trim(),
-        description: location.description,
-      });
-      continue;
-    }
-
-    const lat = Number(location.lat);
-    const lon = Number(location.lon);
-    if (!isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
-      entities.push({
-        kind: "point",
-        origin: location.origin,
-        label: location.label.trim(),
-        lat,
-        lon,
-        description: location.description,
-      });
-      continue;
-    }
-
-    const geocoded = await geocodePlaceLabel(location.label.trim());
-    if (geocoded) {
-      entities.push({
-        kind: "point",
-        origin: location.origin,
-        label: location.label.trim(),
-        lat: geocoded.lat,
-        lon: geocoded.lon,
-        description: location.description,
-      });
-    }
-  }
-
-  return dedupeGeoEntities(entities);
+  void locations;
+  return [];
 }
 
 // ── Geo extraction support ────────────────────────────────────────────────────
@@ -1031,12 +1158,18 @@ const REGION_TEXT_ALIASES: Record<string, string> = {
  */
 function extractEntityContext(text: string, searchTerm: string, allEntityNames?: string[]): GeoContext | undefined {
   const URL_RE = /https?:\/\/[^\s\])'"<>,\u0000-\u001f]+/g;
+  const MARKDOWN_LINK_RE = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
   const esc = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const nameRe = new RegExp(`(?<![a-zA-Z])${esc}(?![a-zA-Z])`, "i");
 
+  const catalogItemBlocks = extractCatalogItemBlocks(text);
+  const matchingItemBlock = catalogItemBlocks.find((block) => nameRe.test(block));
+
   // split on blank lines or newlines; keeps article-style paragraphs intact
   const paras = text.split(/\n+/).map((p) => p.trim()).filter(Boolean);
-  let relevant = paras.filter((p) => nameRe.test(p));
+  let relevant = matchingItemBlock
+    ? [matchingItemBlock]
+    : paras.filter((p) => nameRe.test(p));
 
   if (!relevant.length) return undefined;
 
@@ -1070,39 +1203,61 @@ function extractEntityContext(text: string, searchTerm: string, allEntityNames?:
 
   // Parse structured MCP key-value fields: **Key:** Value
   const mcpFields: Array<{ label: string; value: string }> = [];
-  const fieldRe = /\*\*([^*:]+):\*\*\s*(.+)/g;
+  const fieldRe = /(?:^|\n)(?:[-*]\s*)?(?:\*\*([^*:]+):\*\*|([^:\n]+):)\s*(.+)/g;
   const relevantBlock = relevant.join("\n");
   let fm: RegExpExecArray | null;
   while ((fm = fieldRe.exec(relevantBlock)) !== null && mcpFields.length < 8) {
-    const label = fm[1].trim();
-    const value = fm[2].replace(/\*\*/g, "").trim();
+    const label = (fm[1] ?? fm[2] ?? "").trim().replace(/^[-*]\s*/, "");
+    const value = fm[3].replace(/\*\*/g, "").trim();
     if (label && value) mcpFields.push({ label, value });
   }
 
   // Collect URLs from relevant paragraphs
-  const urlSet = new Set<string>();
+  const urlSet = new Map<string, string>();
   for (const para of relevant) {
+    MARKDOWN_LINK_RE.lastIndex = 0;
+    let markdownMatch: RegExpExecArray | null;
+    while ((markdownMatch = MARKDOWN_LINK_RE.exec(para)) !== null) {
+      urlSet.set(markdownMatch[2].replace(/[.,;:!?)]+$/, ""), markdownMatch[1].trim());
+    }
+
     URL_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
-    while ((m = URL_RE.exec(para)) !== null) urlSet.add(m[0].replace(/[.,;:!?)]+$/, ""));
+    while ((m = URL_RE.exec(para)) !== null) {
+      const url = m[0].replace(/[.,;:!?)]+$/, "");
+      if (!urlSet.has(url)) urlSet.set(url, "");
+    }
   }
 
   // Also scan a window around the first occurrence in full text
   const nameIdx = text.search(nameRe);
   if (nameIdx >= 0) {
     const chunk = text.slice(Math.max(0, nameIdx - 60), nameIdx + 900);
+    MARKDOWN_LINK_RE.lastIndex = 0;
+    let markdownMatch: RegExpExecArray | null;
+    while ((markdownMatch = MARKDOWN_LINK_RE.exec(chunk)) !== null) {
+      const url = markdownMatch[2].replace(/[.,;:!?)]+$/, "");
+      if (!urlSet.has(url)) urlSet.set(url, markdownMatch[1].trim());
+    }
+
     URL_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
-    while ((m = URL_RE.exec(chunk)) !== null) urlSet.add(m[0].replace(/[.,;:!?)]+$/, ""));
+    while ((m = URL_RE.exec(chunk)) !== null) {
+      const url = m[0].replace(/[.,;:!?)]+$/, "");
+      if (!urlSet.has(url)) urlSet.set(url, "");
+    }
   }
 
   const summary = mcpFields.length
     ? ""
     : relevant.slice(0, 3).join(" ").replace(/\s+/g, " ").trim().slice(0, 420);
 
-  const links = [...urlSet]
+  const links = [...urlSet.entries()]
     .slice(0, 4)
-    .map((url) => {
+    .map(([url, explicitLabel]) => {
+      if (explicitLabel) {
+        return { url, label: explicitLabel };
+      }
       try {
         const label = new URL(url).hostname.replace(/^www\./, "");
         return { url, label };
@@ -1122,10 +1277,67 @@ const NON_PLACE_LEFT = new Set([
 
 const NON_PLACE_TERMS = new Set([
   "MCP", "STAC", "RA", "Items", "Collection", "Collections", "Notes", "Next", "Tell",
-  "Asset", "Assets", "Catalog", "Metadata", "Item", "Collection-level",
-  "Thumbnail", "External", "Specifications", "GeoPackage",
-  "Leaf", "Above", "Phase", "Tile", "Index", "Endpoint",
+  "Asset", "Assets", "Catalog", "Metadata", "Item", "Collection-level", "Sentinel",
+  "SPOT", "Orthoimages", "Aerial", "Thumbnail", "External", "Specifications", "GeoPackage",
+  "Leaf", "Above", "Phase", "Tile", "Index", "Endpoint", "Source",
 ]);
+
+interface PlaceMentionCandidate {
+  label: string;
+  geocodeLabel: string;
+  origin: "source" | "context";
+  requiresSourceContext: boolean;
+}
+
+function toDisplayPlaceLabel(value: string): string {
+  return value
+    .trim()
+    .split(/\s+/)
+    .map((part) => part ? part.charAt(0).toUpperCase() + part.slice(1) : part)
+    .join(" ");
+}
+
+function extractRegionalQualifier(text: string): string | null {
+  const qualifierRe = /\b(?:in|across|within|throughout)\s+([\p{Lu}][\p{L}'’.-]+(?:\s+[\p{Lu}][\p{L}'’.-]+){0,3})\b(?:\s+by\b|\s+using\b|\s+with\b|\s+based\b|\s+according\b|[,.]|$)/gu;
+  let m: RegExpExecArray | null;
+  while ((m = qualifierRe.exec(text)) !== null) {
+    const candidate = m[1].trim();
+    if (!candidate || NON_PLACE_TERMS.has(candidate)) continue;
+    return candidate;
+  }
+
+  const fallbackQualifierRe = /\b(?:in|across|within|throughout)\s+([\p{L}'’.-]+(?:\s+[\p{L}'’.-]+){0,3})\b(?:\s+by\b|\s+using\b|\s+with\b|\s+based\b|\s+according\b|[,.]|$)/giu;
+  while ((m = fallbackQualifierRe.exec(text)) !== null) {
+    const candidate = m[1].trim();
+    if (!candidate || NON_PLACE_TERMS.has(toDisplayPlaceLabel(candidate))) continue;
+    if (candidate.split(/\s+/).length > 4) continue;
+    return toDisplayPlaceLabel(candidate);
+  }
+  return null;
+}
+
+function extractRankedPlaceMentions(text: string): string[] {
+  const out = new Set<string>();
+  const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+
+  for (const line of lines) {
+    const normalized = line
+      .replace(/^(?:[-*•]\s*)/, "")
+      .replace(/^\d+[.)]\s*/, "")
+      .trim();
+    const match = normalized.match(/^([\p{Lu}][\p{L}'’.-]+(?:\s+[\p{Lu}][\p{L}'’.-]+){0,4})\s*(?:[—–-]|:)\s*(.+)$/u);
+    if (!match) continue;
+
+    const candidate = match[1].trim();
+    const value = match[2].trim();
+    if (!candidate || NON_PLACE_TERMS.has(candidate)) continue;
+    if (!/\d/.test(value)) continue;
+    if (value.length > 40 && !/^[\d\s,$.%()/-]+$/.test(value)) continue;
+    out.add(candidate);
+  }
+
+  return [...out].slice(0, 12);
+}
 
 function extractPlaceMentions(text: string): string[] {
   const out = new Set<string>();
@@ -1153,7 +1365,153 @@ function extractPlaceMentions(text: string): string[] {
     out.add(candidate);
   }
 
+  const lowerStandaloneRe = /\b(?:in|of|for|from|near|across|within)\s+([\p{L}'’.-]+(?:\s+[\p{L}'’.-]+){0,2})\b/giu;
+  while ((m = lowerStandaloneRe.exec(text)) !== null) {
+    const rawCandidate = m[1].trim();
+    const candidate = toDisplayPlaceLabel(rawCandidate);
+    if (!candidate || NON_PLACE_TERMS.has(candidate)) continue;
+    if (candidate.split(/\s+/).length > 3) continue;
+    out.add(candidate);
+  }
+
   return [...out].slice(0, 10);
+}
+
+function buildPlaceMentionCandidates(text: string): PlaceMentionCandidate[] {
+  const regionalQualifier = extractRegionalQualifier(text);
+  const candidates: PlaceMentionCandidate[] = [];
+  const seen = new Set<string>();
+
+  const pushCandidate = (candidate: PlaceMentionCandidate) => {
+    const key = `${candidate.origin}:${normalizeMentionLabel(candidate.geocodeLabel)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(candidate);
+  };
+
+  for (const label of extractRankedPlaceMentions(text)) {
+    pushCandidate({
+      label,
+      geocodeLabel: !/,/.test(label) && regionalQualifier ? `${label}, ${regionalQualifier}` : label,
+      origin: "source",
+      requiresSourceContext: false,
+    });
+  }
+
+  for (const label of extractPlaceMentions(text)) {
+    pushCandidate({
+      label,
+      geocodeLabel: label,
+      origin: "context",
+      requiresSourceContext: true,
+    });
+  }
+
+  return candidates.slice(0, 12);
+}
+
+function entityDisplayLabel(entity: GeoEntity): string {
+  return entity.kind === "point" || entity.kind === "extent" ? entity.label : entity.name;
+}
+
+function extractQueryPlaceFocus(text: string): string[] {
+  const directMentions = extractPlaceMentions(text);
+  if (directMentions.length) return directMentions.slice(0, 3);
+
+  const qualifier = extractRegionalQualifier(text);
+  return qualifier ? [qualifier] : [];
+}
+
+function entityMatchesAnyFocus(entity: GeoEntity, focuses: string[]): boolean {
+  const entityLabel = normalizeMentionLabel(entityDisplayLabel(entity));
+  if (!entityLabel) return false;
+
+  return focuses.some((focus) => {
+    const normalizedFocus = normalizeMentionLabel(focus);
+    return normalizedFocus && (entityLabel.includes(normalizedFocus) || normalizedFocus.includes(entityLabel));
+  });
+}
+
+function extractRequestedPlaceFocuses(
+  userText: string,
+  mcpToolArgs: Record<string, unknown>[],
+): { labels: string[]; lat?: number; lon?: number } {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+
+  const pushLabel = (value: unknown) => {
+    const label = String(value ?? "").trim();
+    if (!label || label.length < 2 || label.length > 120) return;
+    const normalized = normalizeMentionLabel(label);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    labels.push(label);
+  };
+
+  for (const args of mcpToolArgs) {
+    pushLabel(args.location);
+    pushLabel(args.city);
+    pushLabel(args.place);
+    pushLabel(args.name);
+
+    const lat = Number(args.latitude ?? args.lat ?? NaN);
+    const lon = Number(args.longitude ?? args.lon ?? args.long ?? NaN);
+    if (!isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+      return { labels, lat, lon };
+    }
+  }
+
+  for (const label of extractQueryPlaceFocus(userText)) {
+    pushLabel(label);
+  }
+
+  return { labels };
+}
+
+function pointNearFocus(point: GeoPoint, lat: number, lon: number): boolean {
+  return Math.abs(point.lat - lat) <= 1.5 && Math.abs(point.lon - lon) <= 1.5;
+}
+
+function filterEntitiesToRequestedPlace(
+  entities: GeoEntity[],
+  focus: { labels: string[]; lat?: number; lon?: number },
+): GeoEntity[] {
+  const focusedPoints = entities.filter((entity): entity is GeoPoint => {
+    if (entity.kind !== "point") return false;
+    if (entityMatchesAnyFocus(entity, focus.labels)) return true;
+    return focus.lat != null && focus.lon != null && pointNearFocus(entity, focus.lat, focus.lon);
+  });
+
+  const focusedAreas = entities.filter((entity) => entity.kind !== "point" && entityMatchesAnyFocus(entity, focus.labels));
+
+  if (focusedPoints.length) {
+    return dedupeGeoEntities([...focusedPoints, ...focusedAreas]);
+  }
+
+  return entities;
+}
+
+function collapseToCanonicalRequestedPoint(
+  entities: GeoEntity[],
+  focus: { labels: string[]; lat?: number; lon?: number },
+  corpus: string,
+): GeoEntity[] {
+  if (focus.lat == null || focus.lon == null) return entities;
+
+  const preferredLabel = focus.labels[0]?.trim() || `${focus.lat.toFixed(4)}, ${focus.lon.toFixed(4)}`;
+  const matchingAreas = entities.filter((entity) => entity.kind !== "point" && entityMatchesAnyFocus(entity, focus.labels));
+  const allEntityNames = entities.map((entity) => entityDisplayLabel(entity));
+
+  const canonicalPoint: GeoPoint = {
+    kind: "point",
+    origin: "source",
+    label: preferredLabel,
+    lat: focus.lat,
+    lon: focus.lon,
+    context: extractEntityContext(corpus, preferredLabel, allEntityNames),
+  };
+
+  return dedupeGeoEntities([canonicalPoint, ...matchingAreas]);
 }
 
 async function geocodePlaceLabel(label: string): Promise<{ lat: number; lon: number } | null> {
@@ -1167,7 +1525,7 @@ async function geocodePlaceLabel(label: string): Promise<{ lat: number; lon: num
 
   try {
     const res = await fetch(
-      `${GEOCODER_URL}?${params}`,
+      `https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?${params}`,
     );
     if (!res.ok) return null;
     const json: any = await res.json();
@@ -1207,7 +1565,7 @@ function sourceEntityTerms(sourceEntities: GeoEntity[]): string[] {
   const seen = new Set<string>();
   const terms: string[] = [];
   for (const entity of sourceEntities) {
-    const raw = entity.kind === "point" ? entity.label : entity.name;
+    const raw = entity.kind === "point" || entity.kind === "extent" ? entity.label : entity.name;
     const normalized = normalizeMentionLabel(raw);
     if (!normalized || seen.has(normalized)) continue;
     seen.add(normalized);
@@ -1236,35 +1594,6 @@ function contextPointRelatesToSource(
   });
 }
 
-function contextAreaRelatesToSource(
-  areaName: string,
-  corpus: string,
-  sourceEntities: GeoEntity[],
-  entity?: GeoCountry | GeoRegion,
-): boolean {
-  const terms = sourceEntityTerms(sourceEntities);
-  if (!terms.length) return false;
-
-  const normalizedArea = normalizeMentionLabel(areaName);
-  if (!normalizedArea) return false;
-
-  if (terms.some((term) => term.includes(normalizedArea) || normalizedArea.includes(term))) {
-    return true;
-  }
-
-  const relatedText = [
-    corpus,
-    entity?.description ?? "",
-    entity?.context?.summary ?? "",
-    ...(entity?.context?.mcpFields ?? []).map((field) => `${field.label} ${field.value}`),
-  ].filter(Boolean).join("\n\n");
-
-  return splitContextChunks(relatedText).some((chunk) => {
-    const normalizedChunk = normalizeMentionLabel(chunk);
-    return normalizedChunk.includes(normalizedArea) && terms.some((term) => normalizedChunk.includes(term));
-  });
-}
-
 function filterStrictContextGeometry(entities: GeoEntity[], corpus: string): GeoEntity[] {
   const sourceEntities = entities.filter((entity) => entity.origin === "source");
   if (!sourceEntities.length) {
@@ -1272,11 +1601,8 @@ function filterStrictContextGeometry(entities: GeoEntity[], corpus: string): Geo
   }
 
   return entities.filter((entity) => {
-    if (entity.origin !== "context") return true;
-    if (entity.kind === "point") {
-      return contextPointRelatesToSource(entity.label, corpus, sourceEntities);
-    }
-    return contextAreaRelatesToSource(entity.name, corpus, sourceEntities, entity);
+    if (entity.origin !== "context" || entity.kind !== "point") return true;
+    return contextPointRelatesToSource(entity.label, corpus, sourceEntities);
   });
 }
 
@@ -1346,16 +1672,77 @@ function extractGeoEntitiesFallback(
   return enrichGeoEntityContext(entities, corpus);
 }
 
+function collectSourceGeoEntitiesFromText(text: string): GeoEntity[] {
+  const entities: GeoEntity[] = [];
+  const hints: { coords: Array<{ lat: number; lon: number; label?: string }>; names: string[] } = {
+    coords: [],
+    names: [],
+  };
+
+  const parsed = tryParseJson(text);
+  if (parsed) collectGeoHintsFromJson(parsed, hints);
+  collectGeoHintsFromText(text, hints);
+
+  for (const coord of hints.coords) {
+    entities.push({
+      kind: "point",
+      origin: "source",
+      label: coord.label?.trim() || `${coord.lat.toFixed(2)}°, ${coord.lon.toFixed(2)}°`,
+      lat: coord.lat,
+      lon: coord.lon,
+    });
+  }
+
+  entities.push(...extractSourceExtentEntitiesFromText(text));
+
+  return dedupeGeoEntities(entities);
+}
+
+function extractSourceExtentEntitiesFromText(text: string): GeoExtent[] {
+  const entities: GeoExtent[] = [];
+  const catalogItemBlocks = extractCatalogItemBlocks(text);
+
+  for (const block of catalogItemBlocks) {
+    const label = deriveCatalogItemLabel(block);
+    if (!label) continue;
+
+    const bboxMatch = block.match(
+      /bbox:\s*(?:\[\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*\]|\[\s*\n\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*\n\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*\n\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*\n\s*(-?\d{1,3}(?:\.\d+)?)\s*\n\s*\])/i,
+    );
+    if (!bboxMatch) continue;
+
+    const values = bboxMatch.slice(1).filter((value) => value != null && value !== "");
+    const west = Number(values[0]);
+    const south = Number(values[1]);
+    const east = Number(values[2]);
+    const north = Number(values[3]);
+    if ([west, south, east, north].some((value) => isNaN(value))) continue;
+    if (Math.abs(west) > 180 || Math.abs(east) > 180 || Math.abs(south) > 90 || Math.abs(north) > 90) continue;
+    if (west >= east || south >= north) continue;
+
+    entities.push({
+      kind: "extent",
+      origin: "source",
+      label,
+      west,
+      south,
+      east,
+      north,
+    });
+  }
+
+  return entities;
+}
+
 function deriveSingleSourcePointFastPath(
   text: string,
   sourceEntities: GeoEntity[],
-  contextEntities: GeoEntity[] = [],
   toolOutputTexts: string[] = [],
 ): GeoEntity[] | null {
   const sourcePoints = sourceEntities.filter((entity): entity is GeoPoint => entity.kind === "point");
   const hasSourcePolygons = sourceEntities.some((entity) => entity.kind !== "point");
 
-  if (sourcePoints.length !== 1 || hasSourcePolygons || contextEntities.length > 0) {
+  if (sourcePoints.length !== 1 || hasSourcePolygons) {
     return null;
   }
 
@@ -1366,12 +1753,11 @@ function deriveSingleSourcePointFastPath(
 function deriveExactSourcePointEntities(
   text: string,
   sourceEntities: GeoEntity[],
-  contextEntities: GeoEntity[] = [],
   toolOutputTexts: string[] = [],
 ): GeoEntity[] | null {
   const sourcePoints = sourceEntities.filter((entity): entity is GeoPoint => entity.kind === "point");
-  const hasOnlySourcePoints = sourcePoints.length > 0 && sourcePoints.length === sourceEntities.length;
-  if (!hasOnlySourcePoints || contextEntities.length > 0) {
+  const hasSourcePolygons = sourceEntities.some((entity) => entity.kind !== "point");
+  if (!sourcePoints.length || hasSourcePolygons) {
     return null;
   }
 
@@ -1384,32 +1770,22 @@ async function deriveGeoEntities(
   mcpToolArgs: Record<string, unknown>[],
   toolOutputTexts: string[] = [],
 ): Promise<GeoEntity[]> {
-  const sourceEntities = collectSourceGeoEntities(mcpToolArgs, toolOutputTexts);
-  const contextEntities = extractContextTextEntities(text);
-
-  const exactSourcePointEntities = deriveExactSourcePointEntities(
-    text,
-    sourceEntities,
-    contextEntities,
-    toolOutputTexts,
-  );
+  const sourceEntities = dedupeGeoEntities([
+    ...collectSourceGeoEntities(mcpToolArgs, toolOutputTexts),
+    ...collectSourceGeoEntitiesFromText(text),
+  ]);
+  const exactSourcePointEntities = deriveExactSourcePointEntities(text, sourceEntities, toolOutputTexts);
   if (exactSourcePointEntities) {
     return exactSourcePointEntities;
   }
 
-  const singlePointFastPath = deriveSingleSourcePointFastPath(
-    text,
-    sourceEntities,
-    contextEntities,
-    toolOutputTexts,
-  );
+  const singlePointFastPath = deriveSingleSourcePointFastPath(text, sourceEntities, toolOutputTexts);
   if (singlePointFastPath) {
     return singlePointFastPath;
   }
 
-  const plannedLocations = await deriveGeoRenderPlan(text, mcpToolArgs, toolOutputTexts);
-  const plannedEntities = await planLocationsToGeoEntities(plannedLocations);
-  const merged = [...sourceEntities, ...plannedEntities, ...contextEntities];
+  const contextEntities = extractContextTextEntities(text);
+  const merged = [...sourceEntities, ...contextEntities];
   if (merged.length) {
     const corpus = [text, ...toolOutputTexts].filter(Boolean).join("\n\n");
     return enrichGeoEntityContext(merged, corpus);
@@ -1418,85 +1794,6 @@ async function deriveGeoEntities(
 }
 
 // ── Agent Registration ────────────────────────────────────────────────────────
-
-const FALLBACK_MCP_DESCRIPTION =
-  "Use this agent for ALL requests that require fetching real-world, live, or external data " +
-  "from an MCP server. This includes: current news, headlines, articles, weather, events, prices, " +
-  "search results, geospatial imagery catalogs (STAC), satellite collections, orthophotos, traffic, " +
-  "business data, and any other information retrieved from an external API or data source. " +
-  "Always prefer this agent when the user asks about real-world facts, current events, or any data " +
-  "not already visible in the open map layers.";
-
-/**
- * Build a routing description for the MCP agent from a set of real discovered tools.
- * The description is what the arcgis-assistant orchestrator reads to decide which agent handles a query.
- */
-function buildDescriptionFromTools(
-  tools: McpToolDef[],
-  serverName: string,
-  knowledgeBase?: McpKnowledgeBaseDocument | null,
-): string {
-  if (!tools.length) return FALLBACK_MCP_DESCRIPTION;
-
-  const lines: string[] = [];
-  lines.push(
-    `Use this agent for ALL requests served by the "${serverName}" external data server.`,
-    `It can answer queries about the following capabilities (always prefer it over built-in agents for these):`,
-    "",
-  );
-
-  for (const t of tools.slice(0, 25)) {
-    const desc = t.description
-      ? t.description.split(/[\n.]/)[0].trim().slice(0, 140)
-      : "";
-    lines.push(desc ? `- ${t.name}: ${desc}` : `- ${t.name}`);
-  }
-
-  if (tools.length > 25) {
-    lines.push(`- … and ${tools.length - 25} more tools`);
-  }
-
-  lines.push(
-    "",
-    "Also use this agent for any real-world fact, current event, live data, or information " +
-    "that is not already present in the currently loaded map layers.",
-  );
-
-  const knowledgeBaseSupplement = buildKnowledgeBaseDescriptionSupplement(knowledgeBase ?? null, tools);
-  if (knowledgeBaseSupplement) {
-    lines.push(knowledgeBaseSupplement);
-  }
-
-  return lines.join("\n");
-}
-
-/**
- * Re-discover tools from the MCP server and update the registered agent's description.
- * Safe to call any time a server starts or its tool set changes.
- */
-export async function refreshMcpAgentDescription(assistant: HTMLElement): Promise<void> {
-  const agentEl = assistant.querySelector('[data-agent-id="mcp-passthrough-agent"]') as any;
-  if (!agentEl?.agent) return;
-
-  const baseUrl: string = agentEl._mcpBaseUrl ?? "";
-  const serverName: string = agentEl.agent.name ?? "MCP Server";
-  if (!baseUrl) return;
-
-  try {
-    const [tools, knowledgeBase] = await Promise.all([
-      listMcpTools(baseUrl),
-      fetchMcpKnowledgeBase(baseUrl),
-    ]);
-    if (tools.length) {
-      agentEl.agent = {
-        ...agentEl.agent,
-        description: buildDescriptionFromTools(tools, serverName, knowledgeBase),
-      };
-    }
-  } catch {
-    // best-effort — keep the existing description
-  }
-}
 
 export function registerMcpPassthroughAgent(
   assistant: HTMLElement,
@@ -1548,6 +1845,10 @@ export function registerMcpPassthroughAgent(
         reducer: (_current: boolean = false, update: boolean | undefined) => Boolean(update),
         default: () => false,
       }),
+      toolRoundCount: ANNOTATION({
+        reducer: (_current: number = 0, update: number | undefined) => update ?? 0,
+        default: () => 0,
+      }),
     });
 
     async function agentNode(agentState: any) {
@@ -1559,13 +1860,9 @@ export function registerMcpPassthroughAgent(
 
         // Discover tools dynamically from the MCP server (cached per URL).
         let mcpToolDefs: McpToolDef[] = [];
-        let knowledgeBase: McpKnowledgeBaseDocument | null = null;
         let discoveryError: string | null = null;
         try {
-          [mcpToolDefs, knowledgeBase] = await Promise.all([
-            listMcpTools(resolvedUrl),
-            fetchMcpKnowledgeBase(resolvedUrl),
-          ]);
+          mcpToolDefs = await listMcpTools(resolvedUrl);
           if (isMcpRunStale(runToken)) {
             return { messages: [], outputMessage: "", canceled: true };
           }
@@ -1589,65 +1886,35 @@ export function registerMcpPassthroughAgent(
         }
 
         const aliasMap: ToolAliasMap = {};
-        const langchainTools = mcpToolDefs.map((def, index) => {
+        const hubServers = await listHubServers(resolvedUrl);
+        const serverLabels = new Map(hubServers.map((server) => [server.id, server.label]));
+        const priorToolRounds = Number(agentState?.toolRoundCount ?? 0);
+        const userText = extractLastUserText(messages);
+        const filteredToolDefs = rankMcpToolsForQuery(mcpToolDefs, userText, serverLabels);
+        const langchainTools = filteredToolDefs.map((def, index) => {
           const alias = makeSafeToolAlias(index);
           aliasMap[alias] = def.name;
+          const { serverId } = parseQualifiedToolName(def.name);
+          const toolServerLabel = serverId ? (serverLabels.get(serverId) || serverId) : undefined;
           return (
           tool(
-            async (args: any) => callMcpTool(resolvedUrl, def.name, args as Record<string, unknown>),
+            async (args: any) => callMcpTool(
+              resolvedUrl,
+              def.name,
+              normalizeToolArgsForCall(def.inputSchema, (args as Record<string, unknown>) || {}),
+            ),
             {
               name: alias,
-              description: `${def.description || `Tool: ${def.name}`} (MCP tool: ${def.name})`,
+              description: summarizeToolDescription(def, toolServerLabel),
               schema: inputSchemaToZod(def.inputSchema) as any,
             }
           )
           );
         });
 
-        const knowledgeBasePrompt = buildKnowledgeBasePromptSupplement(knowledgeBase, mcpToolDefs);
-
         const response = await invokeToolPrompt({
           promptText:
-            `You are connected to the ${serverLabel} MCP server. Use the available tools to fulfill the user's request. Choose the right tool based on its description and required arguments. Do not invent results.
-
-CRITICAL — FOLLOW THE CURRENT REQUEST ONLY:
-Always base your tool call parameters on the user's CURRENT message alone.
-Never reuse collection IDs, data types, search filters, or required parameters from earlier messages in the conversation.
-
-CONSTRAINT CARRY-FORWARD:
-- Treat explicit user constraints such as geography, year/time period, output format, aggregation level, and requested measure as binding unless the user changes them.
-- If the current message resolves only one missing detail, retain the other already-established constraints instead of asking for them again.
-- When a prior step identified candidate variables or series for a specific place/time request, use the user's follow-up selection to proceed with that same place/time request unless the user changes it.
-
-TOOL-DRIVEN BEHAVIOR FOR UNKNOWN MCPS:
-- Rely on the discovered MCP tool descriptions and schemas, not on assumptions about specific providers, collection IDs, or domains.
-- Do not assume a tool requires a location, bbox, date range, or any other parameter unless the tool description/schema indicates that it is required.
-- If the user's request can be satisfied directly by a tool call, do that instead of asking a clarifying question.
-- Ask a clarifying question only when a required argument is genuinely missing and cannot be inferred from the current message.
-- Do not invent collection names, dataset IDs, or parameter requirements.
-
-WHEN TOOL RESULTS CONTAIN GEOMETRY OR GEOSPATIAL ITEMS:
-- All geometry is automatically rendered on the ArcGIS map — do NOT produce GeoJSON, curl commands, or download links.
-- Summarize using the fields actually returned by the tool. When useful, include count, item titles, URLs, location, date range, and resolution if present.
-- If an item exposes location or coverage cues such as geometry, bbox, place names, MGRS tile, path/row, or footprint-related fields, include a concise location/coverage line instead of omitting location.
-- If the tool returns multiple usable links, prefer the links that actually open the item preview, product, or asset content over weaker metadata/self links.
-- If the user asks for specific fields such as titles and URLs, return those fields directly from the tool results.
-
-GENERAL RESPONSES (news, data, text, non-geographic):
-- Return the full content the user asked for: article headlines, titles, summaries, lists, structured data, etc.
-- Format naturally using bullets, numbered lists, or prose as appropriate for the content.
-- Do NOT compress or withhold content for non-geographic results.
-
-TABULAR / STATISTICAL RESPONSES:
-- Keep the requested geography and time period visible in the answer.
-- If tool output includes both machine identifiers and human-readable place names, prefer the human-readable geography in the prose while preserving the machine identifier in structured output only when useful.
-- If the user asks for CSV, return the CSV directly once the needed series/variable has been resolved; do not re-ask for geography or time if those were already fixed.
-
-PROHIBITIONS (always):
-- No raw GeoJSON, WKT, raw coordinate arrays, or bounding boxes in the response text.
-- No curl commands, code snippets, or download/import instructions.
-- No "What would you like next?" or option menus.` +
-            knowledgeBasePrompt,
+            `You are connected to the ${serverLabel} server. This is the primary agent for NON-MAP requests that require external MCP tools. Use the available MCP tools to fulfill the user's request, choose the best matching tool based on descriptions and required arguments, and do not invent results. STAC, asset catalog, collection browsing, and item-listing requests belong here even if the user says show or display. Questions about the currently loaded map, visible layers, or active webmap belong to built-in map exploration capabilities. Some tools may come from different MCP connections; if the user names a connection or data source, prefer tools whose server tag matches that connection. For straightforward rankings, statistics, and current-data requests, minimize tool hopping: prefer one discovery step and one retrieval step, and avoid extra tool rounds unless a required parameter is still missing or the previous tool result explicitly requires another lookup. If the user asks for current or latest U.S. city population and mentions Census without naming a product, prefer the most recent official Census population estimate rather than asking a follow-up unless the choice materially changes the answer. You have already used ${priorToolRounds} MCP tool round(s) in this run. The current query-focused tool subset contains ${filteredToolDefs.length} tool(s) out of ${mcpToolDefs.length} total MCP tools.`,
           messages,
           tools: langchainTools,
           temperature: 0,
@@ -1664,6 +1931,7 @@ PROHIBITIONS (always):
           toolCallArgsList: [],
           toolOutputTextList: [],
           canceled: false,
+          toolRoundCount: priorToolRounds,
         };
       } catch (err: any) {
         if (isMcpRunStale(runToken) || isAbortLikeError(err)) {
@@ -1728,6 +1996,7 @@ PROHIBITIONS (always):
           toolCallArgsList: [...priorArgs, ...collectedArgs],
           toolOutputTextList: [...priorOutputs, ...collectedOutputs],
           canceled: false,
+          toolRoundCount: Number(agentState?.toolRoundCount ?? 0) + 1,
         };
       } catch (err: any) {
         if (isMcpRunStale(runToken) || isAbortLikeError(err)) {
@@ -1764,6 +2033,7 @@ PROHIBITIONS (always):
       }
 
       const messages = normalizeMessages(agentState?.messages);
+      const userQuery = extractLastUserText(messages);
       const lastAiMessage = getLastAiMessage(messages);
       const text =
         contentToText(lastAiMessage?.content) ||
@@ -1787,78 +2057,36 @@ PROHIBITIONS (always):
           const isStale = () => currentToken !== latestGeoRenderToken;
 
           try {
-            // ── GeoJSON Synthesis (fast path — zero LLM calls) ───────────────
-            const synthesized = await synthesizeGeoJson(toolOutputs, toolArgs, text);
-            console.debug(
-              "[MCP Render] synthesized:",
-              synthesized
-                ? `features=${synthesized.features.length}`
-                : "null (no GeoJSON in tool outputs)",
-              "| stale:", isStale(),
-            );
-            if (!isStale() && synthesized && synthesized.features.length > 0) {
-              const entities = await deriveGeoEntities(text, toolArgs, toolOutputs);
-              if (isStale()) return;
-              const mergedSynthesized = mergeSynthesizedPointEntities(synthesized as any, entities);
-              console.debug("[MCP Render] → renderArbitraryGeoJson path", mergedSynthesized.features.map(f => `${f.title}[${f.geometryType}/${f.layerGroup}]`));
-              await renderArbitraryGeoJson(mergedSynthesized as any, deriveSnapshotTitle(text));
-              if (!isStale()) {
-                // Build a lightweight snapshot so downstream agents (feature layer
-                // creation, etc.) still have access to the rendered point locations.
-                setLastAssistantGeoSnapshot({
-                  title: deriveSnapshotTitle(text),
-                  responseText: text,
-                  updatedAt: new Date().toISOString(),
-                  entities: mergedSynthesized.features
-                    .filter(
-                      (f) =>
-                        f.geometryType === "Point" && Array.isArray(f.coordinates),
-                    )
-                    .map((f) => {
-                      const [lon, lat] = f.coordinates as [number, number];
-                      return {
-                        kind: "point" as const,
-                        origin: "source" as const,
-                        label: f.title,
-                        lat,
-                        lon,
-                        description: f.description,
-                      };
-                    }),
-                });
-              }
-              return; // skip entity-based pipeline
-            }
-            if (isStale()) { console.debug("[MCP Render] → stale after synthesis, aborting"); return; }
-            console.debug("[MCP Render] → falling back to entity pipeline (synthesis gave no explicit geometry)");
-
             const entities = await deriveGeoEntities(text, toolArgs, toolOutputs);
             if (isStale()) return;
 
             const corpus = [text, ...toolOutputs].filter(Boolean).join("\n\n");
             const sourceEntities = entities.filter((entity) => entity.origin === "source");
             const hasSourcePoint = sourceEntities.some((entity) => entity.kind === "point");
+            const hasSourceExtent = sourceEntities.some((entity) => entity.kind === "extent");
             const hasExactSourcePoints =
               sourceEntities.some((entity) => entity.kind === "point") &&
               sourceEntities.every((entity) => entity.kind === "point");
 
-            if (!hasExactSourcePoints) {
-              const mentions = extractPlaceMentions(text);
-              for (const mention of mentions) {
+            if (!hasExactSourcePoints && !hasSourceExtent) {
+              const mentionCandidates = buildPlaceMentionCandidates(text);
+              for (const candidate of mentionCandidates) {
                 if (isStale()) return;
 
-                const normalizedMention = normalizeMentionLabel(mention);
-                const hasQualifiedLocation = /,/.test(mention);
+                const normalizedMention = normalizeMentionLabel(candidate.label);
+                const normalizedGeocodeLabel = normalizeMentionLabel(candidate.geocodeLabel);
+                const hasQualifiedLocation = /,/.test(candidate.geocodeLabel);
                 const hasNamedPoint = entities.some(
                   (entity) =>
                     entity.kind === "point" &&
-                    normalizeMentionLabel((entity as GeoPoint).label).includes(normalizedMention),
+                    (normalizeMentionLabel((entity as GeoPoint).label).includes(normalizedMention) ||
+                      normalizeMentionLabel((entity as GeoPoint).label) === normalizedGeocodeLabel),
                 );
                 if (hasNamedPoint) continue;
-                if (!hasQualifiedLocation && hasSourcePoint) continue;
-                if (!contextPointRelatesToSource(mention, corpus, sourceEntities)) continue;
+                if (!hasQualifiedLocation && hasSourcePoint && candidate.origin !== "source") continue;
+                if (candidate.requiresSourceContext && !contextPointRelatesToSource(candidate.label, corpus, sourceEntities)) continue;
 
-                const hit = await geocodePlaceLabel(mention);
+                const hit = await geocodePlaceLabel(candidate.geocodeLabel);
                 if (isStale() || !hit) continue;
 
                 const exists = entities.some(
@@ -1869,21 +2097,59 @@ PROHIBITIONS (always):
                 );
                 if (!exists) {
                   const allEntityNames = entities.map((e) =>
-                    e.kind === "point" ? (e as GeoPoint).label : (e as GeoCountry | GeoRegion).name,
+                    e.kind === "point"
+                      ? (e as GeoPoint).label
+                      : e.kind === "extent"
+                        ? (e as GeoExtent).label
+                        : (e as GeoCountry | GeoRegion).name,
                   );
                   entities.push({
                     kind: "point",
-                    origin: "context",
-                    label: mention,
+                    origin: candidate.origin,
+                    label: candidate.label,
                     lat: hit.lat,
                     lon: hit.lon,
-                    context: extractEntityContext(corpus, mention, allEntityNames),
+                    context: extractEntityContext(corpus, candidate.label, allEntityNames),
                   });
                 }
               }
             }
 
-            const strictEntities = filterStrictContextGeometry(entities, corpus);
+            let strictEntities = filterStrictContextGeometry(entities, corpus);
+            const queryFocuses = extractQueryPlaceFocus(userQuery);
+            const requestedPlaceFocus = extractRequestedPlaceFocuses(userQuery, toolArgs);
+            const isNewsQuery = /\bnews\b|headline|headlines|article/i.test(`${userQuery}\n${text}`);
+            const isWeatherQuery = /\bweather\b|forecast|temperature|rain|wind|humidity|precip|feels like|aqi|air quality/i.test(`${userQuery}\n${text}`);
+
+            if ((isNewsQuery || isWeatherQuery) && (requestedPlaceFocus.labels.length || (requestedPlaceFocus.lat != null && requestedPlaceFocus.lon != null))) {
+              strictEntities = filterEntitiesToRequestedPlace(strictEntities, requestedPlaceFocus);
+            }
+
+            if (isWeatherQuery && requestedPlaceFocus.lat != null && requestedPlaceFocus.lon != null) {
+              strictEntities = collapseToCanonicalRequestedPoint(strictEntities, requestedPlaceFocus, corpus);
+            }
+
+            if (isNewsQuery && queryFocuses.length) {
+              const focusedEntities = strictEntities.filter((entity) => entityMatchesAnyFocus(entity, queryFocuses));
+              if (focusedEntities.length) {
+                strictEntities = focusedEntities;
+              } else {
+                const focus = queryFocuses[0];
+                const geocodedFocus = await geocodePlaceLabel(focus);
+                if (isStale()) return;
+                if (geocodedFocus) {
+                  strictEntities = [{
+                    kind: "point",
+                    origin: "source",
+                    label: focus,
+                    lat: geocodedFocus.lat,
+                    lon: geocodedFocus.lon,
+                    context: extractEntityContext(corpus, focus),
+                  }];
+                }
+              }
+            }
+
             if (isStale()) return;
 
             setLastAssistantGeoSnapshot({
@@ -1893,9 +2159,13 @@ PROHIBITIONS (always):
               entities: strictEntities.map((entity) => ({
                 kind: entity.kind,
                 origin: entity.origin,
-                label: entity.kind === "point" ? entity.label : entity.name,
+                label: entity.kind === "point" || entity.kind === "extent" ? entity.label : entity.name,
                 lat: entity.kind === "point" ? entity.lat : undefined,
                 lon: entity.kind === "point" ? entity.lon : undefined,
+                west: entity.kind === "extent" ? entity.west : undefined,
+                south: entity.kind === "extent" ? entity.south : undefined,
+                east: entity.kind === "extent" ? entity.east : undefined,
+                north: entity.kind === "extent" ? entity.north : undefined,
                 description: entity.description,
                 summary: entity.context?.summary,
                 links: entity.context?.links,
@@ -1932,10 +2202,7 @@ PROHIBITIONS (always):
   const agent = {
     id: agentId,
     name: serverLabel,
-    // Boot with the fallback description; refreshMcpAgentDescription() will
-    // replace it with a richer one derived from real tool names once the server
-    // responds to tools/list.
-    description: FALLBACK_MCP_DESCRIPTION,
+    description: `${MCP_ROUTING_BASE_DESCRIPTION} Connected server: ${serverLabel}. Do not use this for questions about the active map, current layers, or content already loaded in the app.`,
     createGraph,
     workspace: {},
   } as any;
@@ -1953,25 +2220,4 @@ PROHIBITIONS (always):
   agentEl._mcpBaseUrl = ctx.baseUrl ?? "";
   agentEl.agent = agent;
   assistant.appendChild(agentEl);
-
-  // Async: discover real tools and rebuild the description so the orchestrator
-  // can route accurately based on what this server actually exposes.
-  if (ctx.baseUrl) {
-    void (async () => {
-      try {
-        const [tools, knowledgeBase] = await Promise.all([
-          listMcpTools(ctx.baseUrl!),
-          fetchMcpKnowledgeBase(ctx.baseUrl!),
-        ]);
-        if (tools.length) {
-          agentEl.agent = {
-            ...agentEl.agent,
-            description: buildDescriptionFromTools(tools, serverLabel, knowledgeBase),
-          };
-        }
-      } catch {
-        // keep fallback description
-      }
-    })();
-  }
 }

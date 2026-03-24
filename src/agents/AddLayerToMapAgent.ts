@@ -3,7 +3,7 @@ import { invokeToolPrompt } from "@arcgis/ai-orchestrator";
 import { HumanMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
-import { addLayerToCurrentMap, type AddableLayerKind } from "../utils/featureLayerEdits";
+import { addFeatureLayerToCurrentMap } from "../utils/featureLayerEdits";
 import { getCredential, searchPortalLayerByName } from "../utils/arcgisOnline";
 import esriConfig from "@arcgis/core/config";
 
@@ -48,35 +48,25 @@ function normalizeServiceUrl(url: string): string {
   return /\/\d+$/.test(trimmed) ? trimmed : `${trimmed}/0`;
 }
 
-function isSupportedFeatureLayerUrl(url: string): boolean {
-  return /\/(?:featureserver)(?:\/\d+)?$/i.test(url.trim().replace(/\?.*$/, "").replace(/\/+$/, ""));
+function isCatalogListingRequest(text: string): boolean {
+  if (!text.trim()) return false;
+
+  const catalogSignals = /\b(stac|asset catalog|catalog|collection|collections)\b/i;
+  const listingSignals =
+    /\b(latest|recent|newest|list|show|get|find)\b.*\b(items?|assets?|scenes?)\b|\b(items?|assets?|scenes?)\b.*\b(latest|recent|newest)\b/i;
+
+  return catalogSignals.test(text) && listingSignals.test(text);
 }
 
 async function resolveLayerUrl(
   title: string | null,
   itemId: string | null,
   serviceUrl: string | null,
-): Promise<{ url: string; resolvedTitle: string | null; kind: AddableLayerKind } | { error: string }> {
-
-  const inferKindFromUrl = (url: string): AddableLayerKind => {
-    const normalized = url.trim().replace(/\/+$/, "").toLowerCase();
-    if (/\.(tif|tiff)(\?|$)/i.test(normalized)) return "geotiff";
-    if (/\/imageserver$/i.test(normalized)) return "imagery";
-    if (/\/(mapserver)(\/\d+)?$/i.test(normalized)) return "map-image";
-    return "feature";
-  };
+): Promise<{ url: string; resolvedTitle: string | null } | { error: string }> {
 
   // 1. Direct service URL
   if (serviceUrl) {
-    const kind = inferKindFromUrl(serviceUrl);
-    if (kind === "feature" && !isSupportedFeatureLayerUrl(serviceUrl)) {
-      return {
-        error:
-          "That URL is not an ArcGIS FeatureServer layer URL. This app can add FeatureServer, ImageServer, MapServer, and GeoTIFF-backed imagery URLs, but not generic statistical or non-ArcGIS REST endpoints.",
-      };
-    }
-    const url = kind === "feature" ? normalizeServiceUrl(serviceUrl) : serviceUrl.trim().replace(/\/+$/, "");
-    return { url, resolvedTitle: title, kind };
+    return { url: normalizeServiceUrl(serviceUrl), resolvedTitle: title };
   }
 
   // 2. Item ID → look up item metadata then derive service URL
@@ -92,26 +82,8 @@ async function resolveLayerUrl(
       if (json?.error) return { error: `Portal error: ${json.error.message ?? JSON.stringify(json.error)}` };
       const itemUrl: string | null = json?.url ?? null;
       const itemTitle: string | null = json?.title ?? title;
-      const itemType = String(json?.type ?? "").toLowerCase();
-      if (!itemUrl) return { error: `Item ${itemId} was found but has no service URL. Supported layer items need a URL.` };
-      const kind: AddableLayerKind = itemType.includes("geotiff")
-        ? "geotiff"
-        : itemType.includes("imagery") || /\/imageserver$/i.test(itemUrl)
-          ? "imagery"
-          : itemType.includes("map service") || /\/(mapserver)(\/\d+)?$/i.test(itemUrl)
-            ? "map-image"
-            : "feature";
-      if (kind === "feature" && !isSupportedFeatureLayerUrl(itemUrl)) {
-        return {
-          error:
-            `Item ${itemId} resolved to a non-ArcGIS feature endpoint and cannot be loaded as a FeatureLayer: ${itemUrl}`,
-        };
-      }
-      return {
-        url: kind === "feature" ? normalizeServiceUrl(itemUrl) : itemUrl.trim().replace(/\/+$/, ""),
-        resolvedTitle: itemTitle,
-        kind,
-      };
+      if (!itemUrl) return { error: `Item ${itemId} was found but has no service URL. Is it a Feature Service?` };
+      return { url: normalizeServiceUrl(itemUrl), resolvedTitle: itemTitle };
     } catch (err: any) {
       return { error: `Failed to look up item ${itemId}: ${err?.message ?? String(err)}` };
     }
@@ -120,8 +92,8 @@ async function resolveLayerUrl(
   // 3. Title search in ArcGIS Online
   if (title) {
     const found = await searchPortalLayerByName(title);
-    if (found) return { url: found, resolvedTitle: title, kind: "feature" };
-    return { error: `No supported ArcGIS Feature Service named "${title}" was found in your ArcGIS Online content. Try a different title or provide a valid FeatureServer, ImageServer, MapServer, or GeoTIFF URL directly.` };
+    if (found) return { url: found, resolvedTitle: title };
+    return { error: `No Feature Service named "${title}" was found in your ArcGIS Online content. Try a different title or provide the item ID or service URL directly.` };
   }
 
   return { error: "Please provide a layer title, item ID, or service URL." };
@@ -150,6 +122,13 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
     async function addLayerNode(s: any) {
       const text = extractLastUserText(s);
 
+      if (isCatalogListingRequest(text)) {
+        return {
+          outputMessage:
+            "This request is asking for STAC or catalog items, not to add a FeatureServer layer to the map. It should be handled by the MCP catalog tools rather than the Add Layer agent.",
+        };
+      }
+
       // ── Extract intent ──────────────────────────────────────────────────
       let intent: { title: string | null; itemId: string | null; serviceUrl: string | null } =
         { title: null, itemId: null, serviceUrl: null };
@@ -159,7 +138,8 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
           promptText:
             "You extract parameters needed to add a feature layer to a map. " +
             "Always call extract_add_layer_intent with everything you find. " +
-            "The user may provide a title/name, an item ID, or a service URL — extract whichever is present.",
+            "The user may provide a title/name, an item ID, or a service URL — extract whichever is present. " +
+            "Do not treat STAC catalogs, asset catalogs, collection browsing, or item-list requests as layer-add requests.",
           messages: [new HumanMessage(text || "add layer to map")],
           tools: [addLayerTool],
           temperature: 0,
@@ -180,11 +160,7 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
 
       // ── Add to map ──────────────────────────────────────────────────────
       try {
-        await addLayerToCurrentMap({
-          url: resolved.url,
-          title: resolved.resolvedTitle ?? undefined,
-          kind: resolved.kind,
-        });
+        await addFeatureLayerToCurrentMap(resolved.url, resolved.resolvedTitle ?? undefined);
         const displayName = resolved.resolvedTitle ?? resolved.url;
         return {
           outputMessage:
@@ -205,7 +181,7 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
     id: agentId,
     name: "Add Layer to Map",
     description:
-      "Adds a hosted feature layer to the current map. Accepts a layer title/name (searches ArcGIS Online), an ArcGIS Online item ID, or a direct FeatureServer URL. Use when the user wants to load, show, display, or add a layer to the map.",
+      "Adds a hosted feature layer to the current map. Accepts a layer title/name (searches ArcGIS Online), an ArcGIS Online item ID, or a direct FeatureServer URL. Use only when the user wants to load or add a FeatureServer layer into the map. Do not use for STAC, asset catalog, collection, or item-listing requests.",
     createGraph,
     workspace: {},
   } as any;
