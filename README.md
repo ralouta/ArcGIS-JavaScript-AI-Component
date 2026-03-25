@@ -2,6 +2,8 @@
 
 React + Vite app built with ArcGIS Maps SDK, ArcGIS Assistant components, and an MCP hub.
 
+The setup steps below include command equivalents for macOS, Linux, and Windows to reduce shell-specific onboarding errors.
+
 ## Disclaimer
 
 Most of this app has been vibe coded with various coding agents. Review the code, configuration, and deployment choices before using it beyond demos or internal experimentation.
@@ -37,9 +39,25 @@ npm install
 
 ### 3. Create Local Config Files
 
+macOS and Linux:
+
 ```bash
 cp .env.example .env.local
 cp mcp-hub.config.example.json mcp-hub.config.json
+```
+
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env.local
+Copy-Item mcp-hub.config.example.json mcp-hub.config.json
+```
+
+Windows Command Prompt:
+
+```bat
+copy .env.example .env.local
+copy mcp-hub.config.example.json mcp-hub.config.json
 ```
 
 ### 4. Configure Environment
@@ -94,6 +112,27 @@ npm run test:local
 ```
 
 Run the app and hub in separate terminals when using MCP features.
+
+Terminal 1: start the Vite app
+
+```bash
+cd ArcGIS-JavaScript-AI-Component
+npm run dev
+```
+
+Terminal 2: open a new terminal window or tab, change into the repo again, then start the MCP hub
+
+```bash
+cd ArcGIS-JavaScript-AI-Component
+npm run hub
+```
+
+If you are editing the hub and want automatic restarts, use this in Terminal 2 instead:
+
+```bash
+cd ArcGIS-JavaScript-AI-Component
+npm run hub:dev
+```
 
 ## Local Tests
 
@@ -181,7 +220,7 @@ The hub runs on port `8808` by default and is proxied through Vite at `/api/mcp`
 |---|---|
 | Sign-in fails | Check `VITE_ARCGIS_OAUTH_APP_ID` and redirect URLs |
 | Map will not load | Verify the WebMap ID and sharing permissions |
-| MCP tools are unavailable | Confirm `npm run hub` is running and the server status is healthy |
+| MCP tools are unavailable | Confirm you opened a second terminal, changed into the repo folder, and started `npm run hub` or `npm run hub:dev` |
 | Feature layer creation fails | Verify the account can create hosted feature layers |
 | Map-aware answers are weak | Refresh assistant data for the current map |
 
