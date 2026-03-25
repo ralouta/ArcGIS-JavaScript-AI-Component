@@ -1,4 +1,5 @@
 import FeatureLayer from "@arcgis/core/layers/FeatureLayer";
+import GraphicsLayer from "@arcgis/core/layers/GraphicsLayer";
 import GroupLayer from "@arcgis/core/layers/GroupLayer";
 import Graphic from "@arcgis/core/Graphic";
 import Point from "@arcgis/core/geometry/Point";
@@ -19,7 +20,7 @@ export const LAYER_COUNTRY = 1;
 /** Managed ids for client-rendered MCP result layers */
 export const MCP_GEO_LAYER_ID = "mcp-geo-results";
 export const MCP_GEO_SOURCE_LAYER_ID = "mcp-geo-source-results";
-export const MCP_GEO_CONTEXT_LAYER_ID = "mcp-geo-context-results";
+export const MCP_GEO_INTERACTIVE_LAYER_ID = "mcp-geo-interactive-results";
 
 interface RenderLayerCollection {
   prefix: string;
@@ -37,7 +38,7 @@ export interface GeoContext {
   mcpFields?: Array<{ label: string; value: string }>; // structured key-value pairs from MCP output
 }
 
-export type GeoOrigin = "source" | "context";
+export type GeoOrigin = "source";
 
 export interface GeoPoint {
   kind: "point";
@@ -184,11 +185,6 @@ const POINT_SYMBOL = {
   color: [0, 100, 220, 0.92],
   outline: { color: [255, 255, 255, 1], width: 2 },
   size: 13,
-};
-
-const CONTEXT_POINT_SYMBOL = {
-  ...POINT_SYMBOL,
-  color: [255, 106, 0, 0.92],
 };
 
 // ── Popup builders ────────────────────────────────────────────────────────────
@@ -369,9 +365,7 @@ function buildImageCardHtml(ctx?: GeoContext): string {
 }
 
 function pointSymbolFor(pt: GeoPoint) {
-  return pt.origin === "source"
-    ? POINT_SYMBOL
-    : CONTEXT_POINT_SYMBOL;
+  return POINT_SYMBOL;
 }
 
 function normalizePlaceKey(value: string): string {
@@ -385,10 +379,10 @@ function placeKeysMatch(left: string, right: string): boolean {
   return leftKey === rightKey || leftKey.includes(rightKey) || rightKey.includes(leftKey);
 }
 
-function createRenderLayerCollection(origin: GeoOrigin): RenderLayerCollection {
+function createRenderLayerCollection(): RenderLayerCollection {
   return {
-    prefix: origin === "source" ? MCP_GEO_SOURCE_LAYER_ID : MCP_GEO_CONTEXT_LAYER_ID,
-    label: origin === "source" ? "Source" : "Context",
+    prefix: MCP_GEO_SOURCE_LAYER_ID,
+    label: "Source",
     layers: new Map<string, { id: string; title: string; geometryType: "point" | "polygon"; renderer: any; graphics: Graphic[] }>(),
     order: [],
   };
@@ -429,8 +423,6 @@ function buildLayerFields(): Array<{ name: string; alias: string; type: "oid" | 
   return [
     { name: "OBJECTID", alias: "OBJECTID", type: "oid" },
     { name: "name", alias: "name", type: "string" },
-    { name: "_popupTitle", alias: "_popupTitle", type: "string" },
-    { name: "_popupContentHtml", alias: "_popupContentHtml", type: "string" },
   ];
 }
 
@@ -438,17 +430,9 @@ async function createRenderFeatureLayer(layer: { id: string; title: string; geom
   if (!layer.graphics.length) return null;
 
   const source = layer.graphics.map((graphic, index) => {
-    const popupTitle = typeof graphic.popupTemplate?.title === "string"
-      ? graphic.popupTemplate.title
-      : String(graphic.attributes?.name ?? layer.title);
-    const popupContentHtml = typeof graphic.popupTemplate?.content === "string"
-      ? graphic.popupTemplate.content
-      : "";
     const attributes = {
       OBJECTID: index + 1,
       name: String(graphic.attributes?.name ?? layer.title),
-      _popupTitle: popupTitle,
-      _popupContentHtml: popupContentHtml,
     };
     return new Graphic({
       geometry: graphic.geometry,
@@ -468,12 +452,9 @@ async function createRenderFeatureLayer(layer: { id: string; title: string; geom
     geometryType: layer.geometryType,
     spatialReference: { wkid: 4326 },
     renderer: layer.renderer,
-    outFields: ["*"],
-    popupEnabled: true,
-    popupTemplate: {
-      title: "{_popupTitle}",
-      content: (feature: any) => String(feature?.graphic?.attributes?._popupContentHtml ?? ""),
-    } as any,
+    outFields: ["name"],
+    popupEnabled: false,
+    opacity: 0,
   } as any);
 }
 
@@ -573,11 +554,11 @@ function buildRegionPopupContent(attrs: Record<string, any>, ctx?: GeoContext): 
 }
 
 function buildPointPopupContent(pt: GeoPoint): string {
-  const summaryBadge = badge(pt.origin === "source" ? "Source point" : "Context point", "accent");
+  const summaryBadge = badge("Source point", "accent");
   const desc = pt.description ? `<p style="margin:8px 0 0;font-size:0.84rem;color:#2f3a45;line-height:1.45">${esc(pt.description)}</p>` : "";
   const metadata = buildRows([
     { label: "Place", value: pt.label },
-    { label: "Geometry", value: pt.origin === "source" ? "Source-derived point" : "Context-derived point" },
+    { label: "Geometry", value: "Source-derived point" },
     { label: "Lat / Lon", value: `${pt.lat.toFixed(4)}°, ${pt.lon.toFixed(4)}°` },
   ]);
 
@@ -592,7 +573,7 @@ function buildPointPopupContent(pt: GeoPoint): string {
 
 function buildExtentPopupContent(extent: GeoExtent): string {
   const summaryBadge = badge("Extent", "accent");
-  const originBadge = badge(extent.origin === "source" ? "Map footprint" : "Context geometry");
+  const originBadge = badge("Map footprint");
   const desc = extent.description ? `<p style="margin:8px 0 0;font-size:0.84rem;color:#2f3a45;line-height:1.45">${esc(extent.description)}</p>` : "";
   const bounds = buildRows([
     { label: "West / South", value: `${extent.west.toFixed(4)}, ${extent.south.toFixed(4)}` },
@@ -721,11 +702,8 @@ export async function renderMcpGeoEntities(
 
   clearMcpGeoLayer();
 
-  const sourceCollection = createRenderLayerCollection("source");
-  const contextCollection = createRenderLayerCollection("context");
-
-  const sourceEntities = entities.filter((entity) => entity.origin === "source");
-  const contextEntities = entities.filter((entity) => entity.origin === "context");
+  const sourceCollection = createRenderLayerCollection();
+  const sourceEntities = entities;
 
   async function addEntitiesToCollection(targetCollection: RenderLayerCollection, layerEntities: GeoEntity[]): Promise<void> {
     const countries = layerEntities.filter((e): e is GeoCountry => e.kind === "country");
@@ -874,31 +852,38 @@ export async function renderMcpGeoEntities(
     }
   }
 
-  const loadingTasks = [
-    addEntitiesToCollection(sourceCollection, sourceEntities),
-    addEntitiesToCollection(contextCollection, contextEntities),
-  ];
+  await addEntitiesToCollection(sourceCollection, sourceEntities);
 
-  await Promise.all(loadingTasks);
-
+  const interactiveGraphics = collectionGraphics(sourceCollection);
   const layersToAdd = [
     ...(await nonEmptyCollectionLayers(sourceCollection)),
-    ...(await nonEmptyCollectionLayers(contextCollection)),
   ];
-  if (!layersToAdd.length) return;
+  if (!layersToAdd.length && !interactiveGraphics.length) return;
 
-  const group = new GroupLayer({
-    id: MCP_GEO_LAYER_ID,
-    title: "MCP Results",
-    listMode: "show",
-    visibilityMode: "independent",
-    layers: layersToAdd,
-  });
-  view.map.add(group);
+  if (layersToAdd.length) {
+    const group = new GroupLayer({
+      id: MCP_GEO_LAYER_ID,
+      title: "MCP Results",
+      listMode: "show",
+      visibilityMode: "independent",
+      layers: layersToAdd,
+    });
+    view.map.add(group);
+  }
+
+  if (interactiveGraphics.length) {
+    const interactiveLayer = new GraphicsLayer({
+      id: MCP_GEO_INTERACTIVE_LAYER_ID,
+      title: "MCP Results Interactive",
+      listMode: "hide",
+      legendEnabled: false,
+      graphics: interactiveGraphics,
+    } as any);
+    view.map.add(interactiveLayer);
+  }
 
   const allGraphics = [
-    ...collectionGraphics(sourceCollection),
-    ...collectionGraphics(contextCollection),
+    ...interactiveGraphics,
   ];
   if (allGraphics.length) {
     try {
@@ -920,7 +905,7 @@ export function clearMcpGeoLayer(): void {
   const idsToRemove = new Set<string>([
     MCP_GEO_LAYER_ID,
     MCP_GEO_SOURCE_LAYER_ID,
-    MCP_GEO_CONTEXT_LAYER_ID,
+    MCP_GEO_INTERACTIVE_LAYER_ID,
   ]);
   const layers = view.map.layers?.toArray?.() ?? [];
   for (const layer of layers) {
@@ -928,7 +913,6 @@ export function clearMcpGeoLayer(): void {
     if (
       idsToRemove.has(layerId)
       || layerId.startsWith(`${MCP_GEO_SOURCE_LAYER_ID}-`)
-      || layerId.startsWith(`${MCP_GEO_CONTEXT_LAYER_ID}-`)
     ) {
       view.map.remove(layer);
     }

@@ -54,6 +54,9 @@ function summarizeEntityForSelection(entity: GeoEntity, index: number): string {
     `origin=${entity.origin}`,
     entity.description ? `description=${JSON.stringify(entity.description.slice(0, 140))}` : "",
     entity.context?.summary ? `summary=${JSON.stringify(entity.context.summary.slice(0, 220))}` : "",
+    entity.context?.mcpFields?.length
+      ? `fields=${JSON.stringify(entity.context.mcpFields.slice(0, 3).map((field) => `${field.label}: ${field.value}`).join(" | "))}`
+      : "",
     entity.context?.links?.[0]?.url ? `link=${entity.context.links[0].url}` : "",
   ].filter(Boolean);
   return `${index}. ${JSON.stringify(label)} (${detailParts.join(", ")})`;
@@ -77,8 +80,9 @@ async function pruneGeoEntitiesWithModel(
         "You are selecting map-worthy geographic entities for an ArcGIS map. " +
         "Use the user's request and the assistant answer to keep only entities that directly anchor the answer geographically. " +
         "Prefer explicit geometry and canonical place names. " +
-        "Reject malformed strings, incidental references, and places that are not central to the answer. " +
-        "If the answer is about one focal geography, keep only entities that help represent that geography.",
+        "Reject malformed strings, incidental references, placeholder location-only records, and places that are not central to the answer. " +
+        "If multiple candidates represent separate returned result items for the same geography, keep each one when it adds distinct supporting context, links, or summaries. " +
+        "Prefer richer entities over placeholders that only restate the place name.",
       messages: [
         new HumanMessage(
           [
