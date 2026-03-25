@@ -69,6 +69,14 @@ async function loadLayer(layerUrl: string): Promise<FeatureLayer> {
   return layer;
 }
 
+function configureLayerForLegend(layer: FeatureLayer, preferredTitle?: string): void {
+  if (preferredTitle?.trim()) {
+    layer.title = preferredTitle.trim();
+  }
+  layer.listMode = "show";
+  layer.legendEnabled = true;
+}
+
 function buildDefaultAttributes(entity: AssistantResultEntity): Record<string, unknown> {
   const usedNames = new Set<string>(["name"]);
   const attributes: Record<string, unknown> = {
@@ -229,8 +237,17 @@ export async function addFeatureLayerToCurrentMap(layerUrl: string, title?: stri
   if (!view?.map) return;
   const normalized = normalizeLayerUrl(layerUrl);
   const existing = view.map.layers.find((layer: any) => layer?.url === normalized);
-  if (existing) return;
+  if (existing) {
+    configureLayerForLegend(existing as FeatureLayer, title);
+    return;
+  }
   const layer = new FeatureLayer({ url: normalized, title: title?.trim() || undefined });
+  configureLayerForLegend(layer, title);
+  await layer.load();
+  if (!layer.title?.trim()) {
+    layer.title = title?.trim() || layer.portalItem?.title || layer.sourceJSON?.name || "Returned Layer";
+  }
+  configureLayerForLegend(layer, layer.title || undefined);
   view.map.add(layer);
 }
 

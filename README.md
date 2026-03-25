@@ -56,9 +56,31 @@ Update `mcp-hub.config.json` with the MCP servers you want to use and any local-
 
 ### 5. Configure ArcGIS OAuth
 
-1. Create an ArcGIS OAuth app.
-2. Add redirect URLs: `http://localhost:5173` and `http://localhost:4173`.
-3. Copy the client ID into `VITE_ARCGIS_OAUTH_APP_ID`.
+1. Sign in to your ArcGIS portal and create a new credential item:
+	- Click `New item`.
+	- In the `New item` popup, click `Developer credentials`.
+2. Choose the credential type:
+	- Select `OAuth 2.0 credential` for user authentication.
+	- Click `Next`.
+3. Add the local redirect URLs:
+	- `http://localhost:5173`
+	- `http://localhost:4173`
+	- Leave the remaining settings at their defaults.
+	- Click `Next`.
+4. Fill in the credential metadata in a way that is easy for you or your team to identify later.
+	For the workshop, you can use values like:
+	- Title: `<your_title>`
+	- Tags: `<tag1>`, `<tag2>`, `<tag3>`
+	- Summary: `Developer credentials for AI Workshop client app exercise.`
+	Then click `Next`.
+5. Review the summary page and click `Create`.
+6. Copy the generated client ID and add it to `.env.local` as the value of `VITE_ARCGIS_OAUTH_APP_ID`.
+
+Example:
+
+```bash
+VITE_ARCGIS_OAUTH_APP_ID=your-generated-client-id
+```
 
 ## Local Run Commands
 
@@ -68,9 +90,30 @@ npm run hub
 npm run hub:dev
 npm run build
 npm run preview
+npm run test:local
 ```
 
 Run the app and hub in separate terminals when using MCP features.
+
+## Local Tests
+
+This workspace includes a local-only test harness in `tests/`.
+
+- The directory is intentionally listed in `.gitignore` so ad hoc validation stays local.
+- The tests exercise the extracted pure MCP core logic used by the app, not browser-only ArcGIS component rendering.
+- Run them with:
+
+```bash
+npm run test:local
+```
+
+What the local tests currently cover:
+
+- MCP endpoint normalization and hub server URL resolution
+- MCP tool prompt construction
+- JSON and fenced-JSON parsing
+- geometry hint extraction from structured MCP payloads and plain text
+- source-backed geometry derivation for points, extents, and countries
 
 ## Using The App
 

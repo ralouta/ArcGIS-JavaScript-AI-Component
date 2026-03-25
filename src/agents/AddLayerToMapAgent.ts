@@ -48,16 +48,6 @@ function normalizeServiceUrl(url: string): string {
   return /\/\d+$/.test(trimmed) ? trimmed : `${trimmed}/0`;
 }
 
-function isCatalogListingRequest(text: string): boolean {
-  if (!text.trim()) return false;
-
-  const catalogSignals = /\b(stac|asset catalog|catalog|collection|collections)\b/i;
-  const listingSignals =
-    /\b(latest|recent|newest|list|show|get|find)\b.*\b(items?|assets?|scenes?)\b|\b(items?|assets?|scenes?)\b.*\b(latest|recent|newest)\b/i;
-
-  return catalogSignals.test(text) && listingSignals.test(text);
-}
-
 async function resolveLayerUrl(
   title: string | null,
   itemId: string | null,
@@ -121,13 +111,6 @@ export function registerAddLayerToMapAgent(assistant: HTMLElement) {
 
     async function addLayerNode(s: any) {
       const text = extractLastUserText(s);
-
-      if (isCatalogListingRequest(text)) {
-        return {
-          outputMessage:
-            "This request is asking for STAC or catalog items, not to add a FeatureServer layer to the map. It should be handled by the MCP catalog tools rather than the Add Layer agent.",
-        };
-      }
 
       // ── Extract intent ──────────────────────────────────────────────────
       let intent: { title: string | null; itemId: string | null; serviceUrl: string | null } =

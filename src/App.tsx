@@ -408,7 +408,35 @@ function ensureAssistantThemeStyle(element: Element): void {
   shadowRoot.appendChild(style);
 }
 
+function ensureAssistantLinksOpenInNewTab(root: Element | ShadowRoot): void {
+  root.querySelectorAll('a[href]').forEach((link) => {
+    const href = link.getAttribute("href")?.trim() ?? "";
+    if (!/^https?:\/\//i.test(href)) {
+      return;
+    }
+    link.setAttribute("target", "_blank");
+    link.setAttribute("rel", "noopener noreferrer");
+  });
+}
+
 function installAssistantUserBubbleStyler(assistant: HTMLElement): () => void {
+  const handleAssistantLinkClick = (event: Event) => {
+    const path = typeof (event as any).composedPath === "function"
+      ? (event as any).composedPath()
+      : [];
+    const anchor = path.find((node: unknown) => node instanceof HTMLAnchorElement) as HTMLAnchorElement | undefined;
+    const href = anchor?.href?.trim() ?? "";
+    if (!anchor || !/^https?:\/\//i.test(href)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    window.open(href, "_blank", "noopener,noreferrer");
+  };
+
+  assistant.addEventListener("click", handleAssistantLinkClick, true);
+
   const observer = new MutationObserver(() => {
     scanTree(assistant);
     if (assistant.shadowRoot) {
@@ -434,6 +462,8 @@ function installAssistantUserBubbleStyler(assistant: HTMLElement): () => void {
   }
 
   function scanTree(root: Element | ShadowRoot): void {
+    ensureAssistantLinksOpenInNewTab(root);
+
     if (root instanceof Element && root.matches("arcgis-assistant")) {
       ensureAssistantThemeStyle(root);
     }
@@ -461,6 +491,7 @@ function installAssistantUserBubbleStyler(assistant: HTMLElement): () => void {
   }
 
   return () => {
+    assistant.removeEventListener("click", handleAssistantLinkClick, true);
     observer.disconnect();
   };
 }

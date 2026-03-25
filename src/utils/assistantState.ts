@@ -9,7 +9,7 @@ export interface AssistantResultField {
 }
 
 export interface AssistantResultEntity {
-  kind: "point" | "country" | "region" | "extent";
+  kind: "point" | "country" | "region" | "named" | "extent";
   origin: "source" | "context";
   label: string;
   lat?: number;
