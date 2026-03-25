@@ -1,4 +1,4 @@
-import GraphicsLayer from "@arcgis/core/layers/GraphicsLayer";
+import FeatureLayer from "@arcgis/core/layers/FeatureLayer";
 import GroupLayer from "@arcgis/core/layers/GroupLayer";
 import Graphic from "@arcgis/core/Graphic";
 import Point from "@arcgis/core/geometry/Point";
@@ -9,48 +9,23 @@ import * as geometryJsonUtils from "@arcgis/core/geometry/support/jsonUtils";
 
 const BOUNDARIES_BASE =
   "https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/WOR_Boundaries_2024/FeatureServer";
+const WORLD_GEOCODER_URL =
+  "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates";
 
 /** Layer IDs inside WOR_Boundaries_2024 */
 export const LAYER_REGION = 0;
 export const LAYER_COUNTRY = 1;
 
-/** The GroupLayer id we manage on the map */
+/** Managed ids for client-rendered MCP result layers */
 export const MCP_GEO_LAYER_ID = "mcp-geo-results";
 export const MCP_GEO_SOURCE_LAYER_ID = "mcp-geo-source-results";
 export const MCP_GEO_CONTEXT_LAYER_ID = "mcp-geo-context-results";
 
-// ── Region name normalisation ─────────────────────────────────────────────────
-
-const REGION_ALIASES: Record<string, string> = {
-  "middle east":          "Western Asia",
-  "east asia":            "Eastern Asia",
-  "southeast asia":       "Southeastern Asia",
-  "south asia":           "Southern Asia",
-  "central asia":         "Central Asia",
-  "east africa":          "Eastern Africa",
-  "west africa":          "Western Africa",
-  "north africa":         "Northern Africa",
-  "southern africa":      "Southern Africa",
-  "central africa":       "Middle Africa",
-  "sub-saharan africa":   "Eastern Africa",
-  "europe":               "Western Europe",
-  "eastern europe":       "Eastern Europe",
-  "western europe":       "Western Europe",
-  "northern europe":      "Northern Europe",
-  "southern europe":      "Southern Europe",
-  "latin america":        "South America",
-  "south america":        "South America",
-  "central america":      "Central America",
-  "north america":        "Northern America",
-  "caribbean":            "Caribbean",
-  "oceania":              "Australia/New Zealand",
-  "australia":            "Australia/New Zealand",
-  "caucasus":             "Western Asia",
-  "balkans":              "Southern Europe",
-};
-
-function normaliseRegionName(raw: string): string {
-  return REGION_ALIASES[raw.toLowerCase()] ?? raw;
+interface RenderLayerCollection {
+  prefix: string;
+  label: string;
+  layers: Map<string, { id: string; title: string; geometryType: "point" | "polygon"; renderer: any; graphics: Graphic[] }>;
+  order: string[];
 }
 
 // ── Geo entity types ──────────────────────────────────────────────────────────
@@ -90,6 +65,14 @@ export interface GeoRegion {
   context?: GeoContext;
 }
 
+export interface GeoNamedPlace {
+  kind: "named";
+  origin: GeoOrigin;
+  name: string;
+  description?: string;
+  context?: GeoContext;
+}
+
 export interface GeoExtent {
   kind: "extent";
   origin: GeoOrigin;
@@ -102,7 +85,7 @@ export interface GeoExtent {
   context?: GeoContext;
 }
 
-export type GeoEntity = GeoPoint | GeoCountry | GeoRegion | GeoExtent;
+export type GeoEntity = GeoPoint | GeoCountry | GeoRegion | GeoNamedPlace | GeoExtent;
 
 // ── REST query helpers ────────────────────────────────────────────────────────
 
@@ -127,6 +110,48 @@ async function queryLayer(
     return Array.isArray(json.features) ? json.features : [];
   } catch {
     return [];
+  }
+}
+
+const geocodeCache = new Map<string, { latitude: number; longitude: number; label: string } | null>();
+
+async function geocodeSingleLine(singleLine: string): Promise<{ latitude: number; longitude: number; label: string } | null> {
+  const cacheKey = singleLine.trim().toLowerCase();
+  if (!cacheKey) return null;
+  if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey) ?? null;
+
+  const params = new URLSearchParams({
+    f: "json",
+    SingleLine: singleLine,
+    maxLocations: "1",
+    outFields: "Match_addr,Addr_type,City,Region",
+    forStorage: "false",
+  });
+
+  try {
+    const response = await fetch(`${WORLD_GEOCODER_URL}?${params.toString()}`);
+    if (!response.ok) {
+      geocodeCache.set(cacheKey, null);
+      return null;
+    }
+    const json: any = await response.json();
+    const candidate = Array.isArray(json?.candidates) ? json.candidates[0] : null;
+    const latitude = Number(candidate?.location?.y);
+    const longitude = Number(candidate?.location?.x);
+    if (isNaN(latitude) || isNaN(longitude)) {
+      geocodeCache.set(cacheKey, null);
+      return null;
+    }
+    const value = {
+      latitude,
+      longitude,
+      label: String(candidate?.attributes?.Match_addr ?? singleLine),
+    };
+    geocodeCache.set(cacheKey, value);
+    return value;
+  } catch {
+    geocodeCache.set(cacheKey, null);
+    return null;
   }
 }
 
@@ -161,26 +186,17 @@ const POINT_SYMBOL = {
   size: 13,
 };
 
-/** Representative point for polygon-based locations when no explicit point exists */
-const LOCATION_CENTER_SYMBOL = {
-  type: "simple-marker",
-  style: "diamond",
-  color: [255, 106, 0, 0.95],
-  outline: { color: [255, 255, 255, 1], width: 1.8 },
-  size: 10,
+const CONTEXT_POINT_SYMBOL = {
+  ...POINT_SYMBOL,
+  color: [255, 106, 0, 0.92],
 };
 
 // ── Popup builders ────────────────────────────────────────────────────────────
 
 /** Sanitise a string for safe HTML embedding */
 function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
 }
-
-const CL = `style="color:#888;padding:2px 10px 2px 0;white-space:nowrap;font-size:0.82rem"`;
-const CV = `style="font-weight:500;font-size:0.88rem"`;
-
-type PointSemanticType = "weather" | "air" | "news" | "catalog" | "place";
 
 function badge(label: string, tone: "neutral" | "accent" = "neutral"): string {
   const style = tone === "accent"
@@ -189,17 +205,41 @@ function badge(label: string, tone: "neutral" | "accent" = "neutral"): string {
   return `<span style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:0.72rem;font-weight:600;${style}">${esc(label)}</span>`;
 }
 
-function formatSectionTitle(ctx?: GeoContext, fallback = "Supporting Context"): string {
-  const haystack = [
-    ctx?.summary ?? "",
-    ...(ctx?.mcpFields ?? []).map((field) => `${field.label} ${field.value}`),
-  ].join(" ").toLowerCase();
+function isLikelyUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value.trim());
+}
 
-  if (/forecast|temperature|humidity|wind|precipitation|weather/.test(haystack)) return "Forecast Snapshot";
-  if (/air quality|aqi|pm2\.5|ozone|pollut/.test(haystack)) return "Air Quality Snapshot";
-  if (/article|headline|news|coverage|times|reuters|independent|post/.test(haystack)) return "Related Coverage";
-  if (/stac|collection|catalog|imagery|ortho|asset/.test(haystack)) return "Catalog Context";
-  return fallback;
+function labelForUrl(url: string, explicitLabel?: string): string {
+  const candidate = explicitLabel?.trim();
+  if (candidate && !isLikelyUrl(candidate) && !/^(?:https?)$/i.test(candidate)) {
+    return candidate;
+  }
+
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "");
+  } catch {
+    return "Open resource";
+  }
+}
+
+function buildLinkButton(url: string, label?: string): string {
+  return `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer"
+            style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;color:#005e95;text-decoration:none;padding:4px 8px;border:1px solid #c7dbe8;border-radius:8px;background:#f6fbff">${esc(labelForUrl(url, label))}</a>`;
+}
+
+function reconstructUrlFromField(label: string, value: string): string | null {
+  if (isLikelyUrl(value)) return value.trim();
+  if (/^(?:https?)$/i.test(label.trim()) && value.trim().startsWith("//")) {
+    return `${label.trim()}:${value.trim()}`;
+  }
+  return null;
+}
+
+function isSummaryLabelText(value: string): boolean {
+  const trimmed = value.trim();
+  return /^[\p{L}][\p{L}\p{N} '&/-]{1,40}$/u.test(trimmed)
+    && !/[/.]/.test(trimmed)
+    && !/^(?:https?|www)$/i.test(trimmed);
 }
 
 function normalizeSummary(summary: string): string {
@@ -210,6 +250,28 @@ function normalizeSummary(summary: string): string {
     .trim();
 }
 
+function cleanPopupTitleText(value: string): string {
+  return value
+    .replace(/^\s*\d+\s*[.)-]?\s*/, "")
+    .replace(/^id\s*:\s*/i, "")
+    .trim();
+}
+
+function findContextFieldValue(ctx: GeoContext | undefined, labelPattern: RegExp): string | undefined {
+  return ctx?.mcpFields?.find((field) => labelPattern.test(field.label))?.value?.trim();
+}
+
+function buildExtentPopupTitle(extent: GeoExtent): string {
+  const itemId = findContextFieldValue(extent.context, /^id$/i);
+  const titleText = cleanPopupTitleText(itemId || extent.label);
+
+  if (extent.origin === "source") {
+    return titleText ? `Map Footprint: ${titleText}` : "Map Footprint";
+  }
+
+  return titleText ? `Context Geometry: ${titleText}` : "Context Geometry";
+}
+
 function buildSummaryHtml(summary?: string): string {
   if (!summary?.trim()) return "";
   const normalized = normalizeSummary(summary);
@@ -217,6 +279,9 @@ function buildSummaryHtml(summary?: string): string {
 
   const renderSummaryItem = (item: string): string => {
     const trimmed = item.trim();
+    if (isLikelyUrl(trimmed)) {
+      return `<li style="margin:0 0 8px;line-height:1.45">${buildLinkButton(trimmed)}</li>`;
+    }
     const quotedTitleMatch = trimmed.match(/^(.*?)\s+[—-]\s+["“](.+?)["”](.*)$/);
     if (quotedTitleMatch) {
       const source = quotedTitleMatch[1].trim().replace(/[—:\-]\s*$/, "");
@@ -230,7 +295,7 @@ function buildSummaryHtml(summary?: string): string {
     }
 
     const sentenceMatch = trimmed.match(/^([^:]{2,80}):\s*(.+)$/);
-    if (sentenceMatch) {
+    if (sentenceMatch && isSummaryLabelText(sentenceMatch[1])) {
       return `<li style="margin:0 0 6px;line-height:1.45"><span style="font-weight:700;color:#23313d">${esc(sentenceMatch[1].trim())}</span><span style="color:#4d5965">: ${esc(sentenceMatch[2].trim())}</span></li>`;
     }
 
@@ -262,7 +327,7 @@ function buildSummaryHtml(summary?: string): string {
       .join("")}</ul>`;
   }
 
-  return `<p style="margin:0;color:#2f3a45;font-size:0.82rem;line-height:1.5">${esc(normalized)}</p>`;
+  return `<p style="margin:0;color:#2f3a45;font-size:0.82rem;line-height:1.5"><span style="font-weight:700;color:#23313d">Summary</span><span style="color:#4d5965">: ${esc(normalized)}</span></p>`;
 }
 
 function buildLinksHtml(links?: Array<{ url: string; label: string }>): string {
@@ -272,8 +337,7 @@ function buildLinksHtml(links?: Array<{ url: string; label: string }>): string {
       <div style="font-size:0.72rem;font-weight:700;color:#62707c;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Resource Links</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px 8px">
         ${links
-          .map((link) => `<a href="${esc(link.url)}" target="_blank" rel="noopener noreferrer"
-            style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;color:#005e95;text-decoration:none;padding:4px 8px;border:1px solid #c7dbe8;border-radius:8px;background:#f6fbff">${esc(link.label)}</a>`)
+          .map((link) => buildLinkButton(link.url, link.label))
           .join("")}
       </div>
     </div>`;
@@ -304,59 +368,122 @@ function buildImageCardHtml(ctx?: GeoContext): string {
     </div>`;
 }
 
-function inferPointSemanticType(pt: GeoPoint): PointSemanticType {
-  const haystack = [
-    pt.label,
-    pt.description ?? "",
-    pt.context?.summary ?? "",
-    ...(pt.context?.mcpFields ?? []).map((field) => `${field.label} ${field.value}`),
-  ].join(" ").toLowerCase();
-
-  if (/forecast|temperature|humidity|precipitation|wind|timezone|weather/.test(haystack)) return "weather";
-  if (/air quality|aqi|pm2\.5|ozone|pollut/.test(haystack)) return "air";
-  if (/article|headline|news|coverage|times|reuters|independent|post/.test(haystack)) return "news";
-  if (/stac|collection|catalog|imagery|orthos|asset|thumbnail/.test(haystack)) return "catalog";
-  return "place";
+function pointSymbolFor(pt: GeoPoint) {
+  return pt.origin === "source"
+    ? POINT_SYMBOL
+    : CONTEXT_POINT_SYMBOL;
 }
 
-function pointSymbolFor(pt: GeoPoint) {
-  const semanticType = inferPointSemanticType(pt);
-  switch (semanticType) {
-    case "weather":
-      return {
-        type: "simple-marker",
-        style: "circle",
-        color: [35, 137, 218, 0.95],
-        outline: { color: [255, 255, 255, 1], width: 2.4 },
-        size: 14,
-      };
-    case "air":
-      return {
-        type: "simple-marker",
-        style: "triangle",
-        color: [0, 158, 96, 0.95],
-        outline: { color: [255, 255, 255, 1], width: 2.1 },
-        size: 15,
-      };
-    case "news":
-      return {
-        type: "simple-marker",
-        style: "square",
-        color: [208, 83, 54, 0.95],
-        outline: { color: [255, 255, 255, 1], width: 2 },
-        size: 13,
-      };
-    case "catalog":
-      return {
-        type: "simple-marker",
-        style: "diamond",
-        color: [0, 123, 146, 0.95],
-        outline: { color: [255, 255, 255, 1], width: 2 },
-        size: 13,
-      };
-    default:
-      return POINT_SYMBOL;
-  }
+function normalizePlaceKey(value: string): string {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function placeKeysMatch(left: string, right: string): boolean {
+  const leftKey = normalizePlaceKey(left);
+  const rightKey = normalizePlaceKey(right);
+  if (!leftKey || !rightKey) return false;
+  return leftKey === rightKey || leftKey.includes(rightKey) || rightKey.includes(leftKey);
+}
+
+function createRenderLayerCollection(origin: GeoOrigin): RenderLayerCollection {
+  return {
+    prefix: origin === "source" ? MCP_GEO_SOURCE_LAYER_ID : MCP_GEO_CONTEXT_LAYER_ID,
+    label: origin === "source" ? "Source" : "Context",
+    layers: new Map<string, { id: string; title: string; geometryType: "point" | "polygon"; renderer: any; graphics: Graphic[] }>(),
+    order: [],
+  };
+}
+
+function ensureRenderLayer(
+  collection: RenderLayerCollection,
+  key: string,
+  title: string,
+  geometryType: "point" | "polygon",
+  symbol: any,
+): { id: string; title: string; geometryType: "point" | "polygon"; renderer: any; graphics: Graphic[] } {
+  const existing = collection.layers.get(key);
+  if (existing) return existing;
+
+  const layer = {
+    id: `${collection.prefix}-${key}`,
+    title: `${collection.label} ${title}`,
+    geometryType,
+    renderer: {
+      type: "simple",
+      symbol,
+    },
+    graphics: [],
+  };
+  collection.layers.set(key, layer);
+  collection.order.push(key);
+  return layer;
+}
+
+function collectionLayers(collection: RenderLayerCollection): Array<{ id: string; title: string; geometryType: "point" | "polygon"; renderer: any; graphics: Graphic[] }> {
+  return collection.order
+    .map((key) => collection.layers.get(key))
+    .filter((layer): layer is { id: string; title: string; geometryType: "point" | "polygon"; renderer: any; graphics: Graphic[] } => Boolean(layer));
+}
+
+function buildLayerFields(): Array<{ name: string; alias: string; type: "oid" | "string" }> {
+  return [
+    { name: "OBJECTID", alias: "OBJECTID", type: "oid" },
+    { name: "name", alias: "name", type: "string" },
+    { name: "_popupTitle", alias: "_popupTitle", type: "string" },
+    { name: "_popupContentHtml", alias: "_popupContentHtml", type: "string" },
+  ];
+}
+
+async function createRenderFeatureLayer(layer: { id: string; title: string; geometryType: "point" | "polygon"; renderer: any; graphics: Graphic[] }): Promise<FeatureLayer | null> {
+  if (!layer.graphics.length) return null;
+
+  const source = layer.graphics.map((graphic, index) => {
+    const popupTitle = typeof graphic.popupTemplate?.title === "string"
+      ? graphic.popupTemplate.title
+      : String(graphic.attributes?.name ?? layer.title);
+    const popupContentHtml = typeof graphic.popupTemplate?.content === "string"
+      ? graphic.popupTemplate.content
+      : "";
+    const attributes = {
+      OBJECTID: index + 1,
+      name: String(graphic.attributes?.name ?? layer.title),
+      _popupTitle: popupTitle,
+      _popupContentHtml: popupContentHtml,
+    };
+    return new Graphic({
+      geometry: graphic.geometry,
+      attributes,
+    });
+  });
+
+  return new FeatureLayer({
+    id: layer.id,
+    title: layer.title,
+    listMode: "show",
+    legendEnabled: true,
+    source,
+    objectIdField: "OBJECTID",
+    fields: buildLayerFields(),
+    displayField: "name",
+    geometryType: layer.geometryType,
+    spatialReference: { wkid: 4326 },
+    renderer: layer.renderer,
+    outFields: ["*"],
+    popupEnabled: true,
+    popupTemplate: {
+      title: "{_popupTitle}",
+      content: (feature: any) => String(feature?.graphic?.attributes?._popupContentHtml ?? ""),
+    } as any,
+  } as any);
+}
+
+async function nonEmptyCollectionLayers(collection: RenderLayerCollection): Promise<FeatureLayer[]> {
+  const layers = await Promise.all(collectionLayers(collection).map((layer) => createRenderFeatureLayer(layer)));
+  return layers.filter((layer): layer is FeatureLayer => Boolean(layer));
+}
+
+function collectionGraphics(collection: RenderLayerCollection): Graphic[] {
+  return collectionLayers(collection).flatMap((layer) => layer.graphics);
 }
 
 function hasValue(value: unknown): boolean {
@@ -382,30 +509,32 @@ function formatDisplayValue(value: unknown): string {
 function buildRows(rows: Array<{ label: string; value: unknown }>): string {
   const visible = rows.filter((row) => hasValue(row.value));
   if (!visible.length) return "";
-  return `<table style="border-collapse:collapse;min-width:190px">` +
-    visible.map((row) => `<tr><td ${CL}>${esc(row.label)}</td><td ${CV}>${esc(formatDisplayValue(row.value))}</td></tr>`).join("") +
-    `</table>`;
+  return `<div style="display:flex;flex-direction:column;gap:6px">` +
+    visible.map((row) => `<div style="font-size:0.83rem;line-height:1.45"><span style="font-weight:700;color:#23313d">${esc(row.label)}</span><span style="color:#4d5965">: ${esc(formatDisplayValue(row.value))}</span></div>`).join("") +
+    `</div>`;
 }
 
 /** Render the MCP data section: structured fields + source links + summary */
 function buildContextHtml(ctx?: GeoContext): string {
   if (!ctx?.summary && !ctx?.links?.length && !ctx?.mcpFields?.length) return "";
 
-  const SL = `style="color:#888;padding:2px 8px 2px 0;white-space:nowrap;font-size:0.8rem"`;
-  const SV = `style="font-size:0.8rem;font-weight:500"`;
-
   const fieldsHtml = ctx.mcpFields?.length
-    ? `<table style="border-collapse:collapse;min-width:190px;margin-bottom:6px">` +
-      ctx.mcpFields.map(f =>
-        `<tr><td ${SL}>${esc(f.label)}</td><td ${SV}>${esc(f.value)}</td></tr>`
-      ).join("") +
-      `</table>`
+    ? `<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">` +
+      ctx.mcpFields.map((field) => {
+        const url = reconstructUrlFromField(field.label, field.value);
+        if (url) {
+          const label = /^(?:https?)$/i.test(field.label.trim()) ? "Resource Link" : field.label;
+          return `<div style="font-size:0.82rem;line-height:1.45"><span style="font-weight:700;color:#23313d">${esc(label)}</span><span style="color:#4d5965">: </span>${buildLinkButton(url, field.value)}</div>`;
+        }
+        return `<div style="font-size:0.82rem;line-height:1.45"><span style="font-weight:700;color:#23313d">${esc(field.label)}</span><span style="color:#4d5965">: ${esc(field.value)}</span></div>`;
+      }).join("") +
+      `</div>`
     : "";
 
   const summaryHtml = buildSummaryHtml(ctx.summary);
   const linksHtml = buildLinksHtml(ctx.links);
   const imageHtml = buildImageCardHtml(ctx);
-  const heading = formatSectionTitle(ctx);
+  const heading = "Supporting Context";
 
   return `
     <div style="margin-top:12px;padding-top:10px;border-top:1px solid #e2e7ec">
@@ -444,8 +573,7 @@ function buildRegionPopupContent(attrs: Record<string, any>, ctx?: GeoContext): 
 }
 
 function buildPointPopupContent(pt: GeoPoint): string {
-  const semanticType = inferPointSemanticType(pt);
-  const summaryBadge = badge(semanticType === "air" ? "Air quality" : semanticType.charAt(0).toUpperCase() + semanticType.slice(1), "accent");
+  const summaryBadge = badge(pt.origin === "source" ? "Source point" : "Context point", "accent");
   const desc = pt.description ? `<p style="margin:8px 0 0;font-size:0.84rem;color:#2f3a45;line-height:1.45">${esc(pt.description)}</p>` : "";
   const metadata = buildRows([
     { label: "Place", value: pt.label },
@@ -463,46 +591,23 @@ function buildPointPopupContent(pt: GeoPoint): string {
 }
 
 function buildExtentPopupContent(extent: GeoExtent): string {
-  const summaryBadge = badge("Catalog tile", "accent");
+  const summaryBadge = badge("Extent", "accent");
   const originBadge = badge(extent.origin === "source" ? "Map footprint" : "Context geometry");
   const desc = extent.description ? `<p style="margin:8px 0 0;font-size:0.84rem;color:#2f3a45;line-height:1.45">${esc(extent.description)}</p>` : "";
+  const bounds = buildRows([
+    { label: "West / South", value: `${extent.west.toFixed(4)}, ${extent.south.toFixed(4)}` },
+    { label: "East / North", value: `${extent.east.toFixed(4)}, ${extent.north.toFixed(4)}` },
+  ]);
 
   return `
     <div style="font-family:var(--calcite-sans-family,sans-serif);font-size:0.88rem;line-height:1.5">
       <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">${summaryBadge}${originBadge}</div>
-      <table style="border-collapse:collapse;min-width:190px">
-        <tr><td ${CL}>West / South</td><td ${CV}>${extent.west.toFixed(4)}, ${extent.south.toFixed(4)}</td></tr>
-        <tr><td ${CL}>East / North</td><td ${CV}>${extent.east.toFixed(4)}, ${extent.north.toFixed(4)}</td></tr>
-      </table>
       ${desc}
       ${buildContextHtml(extent.context)}
+      <div style="margin-top:12px;padding-top:10px;border-top:1px solid #e2e7ec">
+        ${bounds}
+      </div>
     </div>`;
-}
-
-function buildLocationPointPopupContent(
-  attrs: Record<string, any>,
-  label: string,
-  ctx?: GeoContext,
-): string {
-  const details = buildRows([
-    { label: "Name", value: firstValue(attrs, ["NAME", "COUNTRY"]) ?? label },
-    { label: "Capital", value: firstValue(attrs, ["CAPITAL", "CAPNAME"]) },
-    { label: "Region", value: firstValue(attrs, ["REGION", "SUBREGION", "SUB_REGION"]) },
-  ]);
-
-  return `
-    <div style="font-family:var(--calcite-sans-family,sans-serif);line-height:1.5">
-      <div style="font-size:0.84rem;color:#666;margin-bottom:6px">Marker placed near the center of ${esc(label)}</div>
-      ${details}
-      ${buildContextHtml(ctx)}
-    </div>`;
-}
-
-function centerPointFromGeometry(geometry: any): Point | null {
-  const center = geometry?.extent?.center;
-  if (!center) return null;
-  if (typeof center.latitude !== "number" || typeof center.longitude !== "number") return null;
-  return new Point({ latitude: center.latitude, longitude: center.longitude });
 }
 
 function bboxToPolygon(extent: GeoExtent): Polygon {
@@ -534,9 +639,9 @@ function extentGraphic(extent: GeoExtent): Graphic | null {
   return new Graphic({
     geometry: bboxToPolygon(extent),
     symbol: EXTENT_SYMBOL as any,
-    attributes: { name: extent.label },
+    attributes: { name: buildExtentPopupTitle(extent) },
     popupTemplate: {
-      title: `{name}`,
+      title: buildExtentPopupTitle(extent),
       content: buildExtentPopupContent(extent),
     } as any,
   });
@@ -565,38 +670,8 @@ function countryFeatureToGraphic(feature: any, entity?: GeoCountry): Graphic | n
     symbol: COUNTRY_SYMBOL as any,
     attributes: { ...attrs, _displayName: name },
     popupTemplate: {
-      title: `{NAME}`,
+      title: String(name),
       content: buildCountryPopupContent(attrs, entity?.context),
-    } as any,
-  });
-}
-
-function countryCenterPointGraphic(feature: any, entity?: GeoCountry): Graphic | null {
-  if (!feature?.geometry) return null;
-
-  let geometry: any;
-  try {
-    geometry = geometryJsonUtils.fromJSON({
-      ...feature.geometry,
-      spatialReference: { wkid: 4326 },
-    });
-  } catch {
-    return null;
-  }
-
-  const center = centerPointFromGeometry(geometry);
-  if (!center) return null;
-
-  const attrs = feature.attributes ?? {};
-  const name = attrs.NAME ?? entity?.name ?? "Location";
-
-  return new Graphic({
-    geometry: center,
-    symbol: LOCATION_CENTER_SYMBOL as any,
-    attributes: { ...attrs, name },
-    popupTemplate: {
-      title: `{name}`,
-      content: buildLocationPointPopupContent(attrs, String(name), entity?.context),
     } as any,
   });
 }
@@ -629,36 +704,6 @@ function regionFeatureToGraphic(feature: any, entity?: GeoRegion): Graphic | nul
   });
 }
 
-function regionCenterPointGraphic(feature: any, entity?: GeoRegion): Graphic | null {
-  if (!feature?.geometry) return null;
-
-  let geometry: any;
-  try {
-    geometry = geometryJsonUtils.fromJSON({
-      ...feature.geometry,
-      spatialReference: { wkid: 4326 },
-    });
-  } catch {
-    return null;
-  }
-
-  const center = centerPointFromGeometry(geometry);
-  if (!center) return null;
-
-  const attrs = feature.attributes ?? {};
-  const region = attrs.REGION ?? entity?.name ?? "Region";
-
-  return new Graphic({
-    geometry: center,
-    symbol: LOCATION_CENTER_SYMBOL as any,
-    attributes: { ...attrs, name: region },
-    popupTemplate: {
-      title: `{name}`,
-      content: buildLocationPointPopupContent(attrs, String(region), entity?.context),
-    } as any,
-  });
-}
-
 // ── Main export ───────────────────────────────────────────────────────────────
 
 /**
@@ -674,48 +719,47 @@ export async function renderMcpGeoEntities(
   const view: any = mapEl?.view;
   if (!view?.map) return;
 
-  // Replace any previous MCP geo layer.
-  const old = view.map.findLayerById(MCP_GEO_LAYER_ID);
-  if (old) view.map.remove(old);
+  clearMcpGeoLayer();
 
-  const sourceLayer = new GraphicsLayer({
-    id: MCP_GEO_SOURCE_LAYER_ID,
-    title: "Source Geometry",
-    listMode: "show",
-  });
-  const contextLayer = new GraphicsLayer({
-    id: MCP_GEO_CONTEXT_LAYER_ID,
-    title: "Context Geometry",
-    listMode: "show",
-  });
+  const sourceCollection = createRenderLayerCollection("source");
+  const contextCollection = createRenderLayerCollection("context");
 
   const sourceEntities = entities.filter((entity) => entity.origin === "source");
   const contextEntities = entities.filter((entity) => entity.origin === "context");
 
-  async function addEntitiesToLayer(targetLayer: GraphicsLayer, layerEntities: GeoEntity[]): Promise<void> {
+  async function addEntitiesToCollection(targetCollection: RenderLayerCollection, layerEntities: GeoEntity[]): Promise<void> {
     const countries = layerEntities.filter((e): e is GeoCountry => e.kind === "country");
     const regions = layerEntities.filter((e): e is GeoRegion => e.kind === "region");
+    const namedPlaces = layerEntities.filter((e): e is GeoNamedPlace => e.kind === "named");
     const extents = layerEntities.filter((e): e is GeoExtent => e.kind === "extent");
     const points = layerEntities.filter((e): e is GeoPoint => e.kind === "point");
-    const polygonEntityCount = countries.length + regions.length;
-    const addRepresentativePoints = points.length === 0 && extents.length === 0 && polygonEntityCount === 1;
+    const polygonEntityCount = countries.length + regions.length + namedPlaces.length;
+    const hasExplicitGeometry = points.length > 0 || extents.length > 0 || countries.length > 0 || regions.length > 0;
+    const areaPlaceNames = [
+      ...countries.map((entity) => entity.name),
+      ...regions.map((entity) => entity.name),
+      ...namedPlaces.map((entity) => entity.name),
+    ];
+    const filteredPoints = polygonEntityCount > 0
+      ? points.filter((point) => !areaPlaceNames.some((name) => placeKeysMatch(point.label, name)))
+      : points;
 
     for (const extent of extents) {
       const g = extentGraphic(extent);
-      if (g) targetLayer.add(g);
+      if (g) ensureRenderLayer(targetCollection, "extents", "Extents", "polygon", EXTENT_SYMBOL).graphics.push(g);
     }
 
-    for (const pt of points) {
+    for (const pt of filteredPoints) {
       const g = new Graphic({
         geometry: new Point({ latitude: pt.lat, longitude: pt.lon }),
         symbol: pointSymbolFor(pt) as any,
         attributes: { name: pt.label },
         popupTemplate: {
-          title: `{name}`,
+          title: pt.label,
           content: buildPointPopupContent(pt),
         } as any,
       });
-      targetLayer.add(g);
+      ensureRenderLayer(targetCollection, "points", "Points", "point", pointSymbolFor(pt)).graphics.push(g);
     }
 
     if (countries.length) {
@@ -727,77 +771,136 @@ export async function renderMcpGeoEntities(
         const name = (feat.attributes?.NAME ?? "").toLowerCase();
         const entity = countries.find((c) => c.name.toLowerCase() === name);
         const g = countryFeatureToGraphic(feat, entity);
-        if (g) targetLayer.add(g);
-        if (addRepresentativePoints) {
-          const center = countryCenterPointGraphic(feat, entity);
-          if (center) targetLayer.add(center);
-        }
+        if (g) ensureRenderLayer(targetCollection, "countries", "Countries", "polygon", COUNTRY_SYMBOL).graphics.push(g);
       }
     }
 
     if (regions.length) {
-      const normalised = regions.map((r) => ({
-        ...r,
-        normalised: normaliseRegionName(r.name),
-      }));
-      const list = normalised
-        .map((r) => `'${r.normalised.replace(/'/g, "''")}'`)
+      const list = regions
+        .map((r) => `'${r.name.replace(/'/g, "''")}'`)
         .join(",");
       const features = await queryLayer(LAYER_REGION, `REGION IN (${list})`);
       for (const feat of features) {
-        const featureRegion = normaliseRegionName(feat.attributes?.REGION ?? "");
-        const entity = normalised.find((r) => r.normalised === featureRegion);
+        const featureRegion = String(feat.attributes?.REGION ?? "");
+        const entity = regions.find((r) => r.name === featureRegion);
         const g = regionFeatureToGraphic(feat, entity);
-        if (g) targetLayer.add(g);
-        if (addRepresentativePoints) {
-          const center = regionCenterPointGraphic(feat, entity);
-          if (center) targetLayer.add(center);
+        if (g) ensureRenderLayer(targetCollection, "regions", "Regions", "polygon", REGION_SYMBOL).graphics.push(g);
+      }
+    }
+
+    if (namedPlaces.length && !hasExplicitGeometry) {
+      const candidateGroups = namedPlaces.map((entity) => ({
+        entity,
+        candidates: buildNamedPlaceCandidates(entity.name),
+      }));
+      const resolvedGroups = new Set<number>();
+
+      const countryNames = [...new Set(candidateGroups.flatMap((group) => group.candidates))];
+      if (countryNames.length) {
+        const list = countryNames.map((name) => `'${name.replace(/'/g, "''")}'`).join(",");
+        const features = await queryLayer(LAYER_COUNTRY, `NAME IN (${list})`);
+        for (const feat of features) {
+          const featureName = String(feat.attributes?.NAME ?? "").trim().toLowerCase();
+          const matchedIndex = candidateGroups.findIndex((group) =>
+            group.candidates.some((candidate) => candidate.toLowerCase() === featureName),
+          );
+          const matched = matchedIndex >= 0 ? candidateGroups[matchedIndex] : null;
+          if (!matched) continue;
+          resolvedGroups.add(matchedIndex);
+          const countryEntity: GeoCountry = {
+            kind: "country",
+            origin: matched.entity.origin,
+            name: String(feat.attributes?.NAME ?? matched.entity.name),
+            description: matched.entity.description,
+            context: matched.entity.context,
+          };
+          const g = countryFeatureToGraphic(feat, countryEntity);
+          if (g) ensureRenderLayer(targetCollection, "countries", "Countries", "polygon", COUNTRY_SYMBOL).graphics.push(g);
         }
+      }
+
+      const regionNames = [...new Set(candidateGroups.flatMap((group) => group.candidates))];
+      if (regionNames.length) {
+        const list = regionNames.map((name) => `'${name.replace(/'/g, "''")}'`).join(",");
+        const features = await queryLayer(LAYER_REGION, `REGION IN (${list})`);
+        for (const feat of features) {
+          const featureRegion = String(feat.attributes?.REGION ?? "");
+          const matchedIndex = candidateGroups.findIndex((group) =>
+            group.candidates.some((candidate) => candidate === featureRegion),
+          );
+          const matched = matchedIndex >= 0 ? candidateGroups[matchedIndex] : null;
+          if (!matched) continue;
+          resolvedGroups.add(matchedIndex);
+          const regionEntity: GeoRegion = {
+            kind: "region",
+            origin: matched.entity.origin,
+            name: String(feat.attributes?.REGION ?? matched.entity.name),
+            description: matched.entity.description,
+            context: matched.entity.context,
+          };
+          const g = regionFeatureToGraphic(feat, regionEntity);
+          if (g) ensureRenderLayer(targetCollection, "regions", "Regions", "polygon", REGION_SYMBOL).graphics.push(g);
+        }
+      }
+
+      for (let index = 0; index < candidateGroups.length; index += 1) {
+        if (resolvedGroups.has(index)) continue;
+        const group = candidateGroups[index];
+        const preferredCandidate = group.candidates[0] ?? group.entity.name;
+        const geocoded = await geocodeSingleLine(preferredCandidate);
+        if (!geocoded) continue;
+
+        const pointEntity: GeoPoint = {
+          kind: "point",
+          origin: group.entity.origin,
+          label: geocoded.label || group.entity.name,
+          lat: geocoded.latitude,
+          lon: geocoded.longitude,
+          description: group.entity.description,
+          context: group.entity.context,
+        };
+
+        const g = new Graphic({
+          geometry: new Point({ latitude: pointEntity.lat, longitude: pointEntity.lon }),
+          symbol: pointSymbolFor(pointEntity) as any,
+          attributes: { name: pointEntity.label },
+          popupTemplate: {
+            title: pointEntity.label,
+            content: buildPointPopupContent(pointEntity),
+          } as any,
+        });
+        ensureRenderLayer(targetCollection, "points", "Points", "point", pointSymbolFor(pointEntity)).graphics.push(g);
       }
     }
   }
 
-  const layersToAdd = [] as GraphicsLayer[];
-  if (sourceEntities.length) layersToAdd.push(sourceLayer);
-  if (contextEntities.length) layersToAdd.push(contextLayer);
+  const loadingTasks = [
+    addEntitiesToCollection(sourceCollection, sourceEntities),
+    addEntitiesToCollection(contextCollection, contextEntities),
+  ];
+
+  await Promise.all(loadingTasks);
+
+  const layersToAdd = [
+    ...(await nonEmptyCollectionLayers(sourceCollection)),
+    ...(await nonEmptyCollectionLayers(contextCollection)),
+  ];
   if (!layersToAdd.length) return;
 
   const group = new GroupLayer({
     id: MCP_GEO_LAYER_ID,
     title: "MCP Results",
-    visibilityMode: "independent",
     listMode: "show",
+    visibilityMode: "independent",
     layers: layersToAdd,
   });
   view.map.add(group);
 
-  const loadingTasks = [
-    addEntitiesToLayer(sourceLayer, sourceEntities),
-    addEntitiesToLayer(contextLayer, contextEntities),
-  ];
-
-  const initialGraphics = [
-    ...((sourceLayer.graphics as any).toArray?.() ?? []),
-    ...((contextLayer.graphics as any).toArray?.() ?? []),
-  ];
-  if (initialGraphics.length) {
-    try {
-      await view.goTo(initialGraphics, {
-        animate: true,
-        duration: initialGraphics.length === 1 ? 280 : 420,
-      });
-    } catch {
-      // goTo may fail if the view is not ready; ignore silently.
-    }
-  }
-
-  await Promise.all(loadingTasks);
-
   const allGraphics = [
-    ...((sourceLayer.graphics as any).toArray?.() ?? []),
-    ...((contextLayer.graphics as any).toArray?.() ?? []),
+    ...collectionGraphics(sourceCollection),
+    ...collectionGraphics(contextCollection),
   ];
-  if (allGraphics.length && allGraphics.length !== initialGraphics.length) {
+  if (allGraphics.length) {
     try {
       await view.goTo(allGraphics, {
         animate: true,
@@ -814,6 +917,38 @@ export function clearMcpGeoLayer(): void {
   const mapEl = document.querySelector("#main-map") as any;
   const view: any = mapEl?.view;
   if (!view?.map) return;
-  const old = view.map.findLayerById(MCP_GEO_LAYER_ID);
-  if (old) view.map.remove(old);
+  const idsToRemove = new Set<string>([
+    MCP_GEO_LAYER_ID,
+    MCP_GEO_SOURCE_LAYER_ID,
+    MCP_GEO_CONTEXT_LAYER_ID,
+  ]);
+  const layers = view.map.layers?.toArray?.() ?? [];
+  for (const layer of layers) {
+    const layerId = String(layer?.id ?? "");
+    if (
+      idsToRemove.has(layerId)
+      || layerId.startsWith(`${MCP_GEO_SOURCE_LAYER_ID}-`)
+      || layerId.startsWith(`${MCP_GEO_CONTEXT_LAYER_ID}-`)
+    ) {
+      view.map.remove(layer);
+    }
+  }
+}
+
+function buildNamedPlaceCandidates(raw: string): string[] {
+  const cleaned = raw
+    .replace(/^\d+\s*[.)-]?\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return [];
+
+  const values = new Set<string>([cleaned]);
+  const withoutParens = cleaned.replace(/\([^)]*\)/g, "").replace(/\s+/g, " ").trim();
+  if (withoutParens) values.add(withoutParens);
+
+  for (const part of cleaned.split(",").map((value) => value.trim()).filter(Boolean)) {
+    values.add(part);
+  }
+
+  return [...values].filter((value) => value.length >= 2 && value.length <= 120);
 }

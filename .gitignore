@@ -33,3 +33,7 @@ demo-script-8-10min.md
 .DS_Store
 .vscode/
 *.log
+
+# Local test harness kept out of git on purpose
+tests/
+test-prompts.txt

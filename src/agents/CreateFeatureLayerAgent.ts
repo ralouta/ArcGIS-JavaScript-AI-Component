@@ -118,6 +118,7 @@ export function registerCreateFeatureLayerAgent(
       desiredFields: ANNOTATION({ reducer: (_c: any, u: any) => (Array.isArray(u) ? u : null), default: () => null }),
       fieldsRequested: ANNOTATION({ reducer: (_c: any, u: any) => Boolean(u), default: () => false }),
       useMemory: ANNOTATION({ reducer: (_c: any, u: any) => Boolean(u), default: () => false }),
+      handoffToExistingLayer: ANNOTATION({ reducer: (_c: any, u: any) => Boolean(u), default: () => false }),
     });
 
     async function parseRequestNode(s: any) {
@@ -152,7 +153,7 @@ export function registerCreateFeatureLayerAgent(
       if (extracted.isNewLayerRequest === false) {
         return {
           desiredName: null, desiredGeometryType: null, desiredFields: null,
-          fieldsRequested: false, useMemory: false,
+          fieldsRequested: false, useMemory: false, handoffToExistingLayer: true,
           outputMessage: "This looks like a request to add to an existing layer. Please use the Manage Feature Layer agent.",
         };
       }
@@ -193,7 +194,7 @@ export function registerCreateFeatureLayerAgent(
         message += "\nWill seed the new layer with the latest assistant results currently in memory or loaded on the map.";
       }
 
-      return { desiredName, desiredGeometryType, desiredFields, fieldsRequested, useMemory, outputMessage: message };
+      return { desiredName, desiredGeometryType, desiredFields, fieldsRequested, useMemory, handoffToExistingLayer: false, outputMessage: message };
     }
 
     async function createLayerNode(s: any) {
@@ -279,7 +280,7 @@ export function registerCreateFeatureLayerAgent(
       .addNode("createLayerNode", createLayerNode)
       .addNode("replyNode", replyNode)
       .addEdge(START, "parseRequestNode")
-      .addConditionalEdges("parseRequestNode", (s: any) => s.desiredName === null && /existing layer/i.test(s.outputMessage ?? "") ? "replyNode" : "createLayerNode")
+      .addConditionalEdges("parseRequestNode", (s: any) => s.handoffToExistingLayer ? "replyNode" : "createLayerNode")
       .addEdge("createLayerNode", "replyNode")
       .addEdge("replyNode", END);
   };
