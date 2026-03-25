@@ -270,9 +270,18 @@ function pointLabelQuality(label: string): number {
   return 3;
 }
 
+function geoContextQuality(context?: GeoContext): number {
+  if (!context) return 0;
+  let score = 0;
+  if (context.summary?.trim()) score += 4;
+  score += Math.min(context.links?.length ?? 0, 2) * 2;
+  score += Math.min(context.mcpFields?.length ?? 0, 4);
+  return score;
+}
+
 function choosePreferredPointEntity(current: GeoPoint, candidate: GeoPoint): GeoPoint {
-  const currentScore = pointLabelQuality(current.label) + (current.context ? 2 : 0);
-  const candidateScore = pointLabelQuality(candidate.label) + (candidate.context ? 2 : 0);
+  const currentScore = pointLabelQuality(current.label) + geoContextQuality(current.context) + (current.description?.trim() ? 3 : 0);
+  const candidateScore = pointLabelQuality(candidate.label) + geoContextQuality(candidate.context) + (candidate.description?.trim() ? 3 : 0);
   return candidateScore > currentScore ? candidate : current;
 }
 
@@ -412,6 +421,14 @@ function buildStructuredRecordContext(record: Record<string, unknown>): GeoConte
   };
 }
 
+function isInformativeGeoContext(context: GeoContext | undefined): boolean {
+  if (!context) return false;
+  if (context.summary?.trim()) return true;
+  if ((context.links?.length ?? 0) > 0) return true;
+  if ((context.mcpFields?.length ?? 0) >= 2) return true;
+  return false;
+}
+
 function collectGenericPlaceMentions(text: string): string[] {
   const candidates: string[] = [];
   const seen = new Set<string>();
@@ -448,6 +465,102 @@ function collectRecordLocationCandidates(fields: ScalarField[]): string[] {
   }
 
   return candidates;
+}
+
+function chooseStructuredRecordLabel(record: Record<string, unknown>, fields: ScalarField[]): string | undefined {
+  const prioritizedKeys = ["name", "location", "city", "country", "region", "place", "title", "headline", "id"];
+
+  for (const key of prioritizedKeys) {
+    const field = fields.find((candidate) => candidate.key.toLowerCase() === key);
+    const value = field?.value?.trim();
+    if (value) return value;
+  }
+
+  for (const [key, value] of Object.entries(record)) {
+    if (!prioritizedKeys.includes(key.toLowerCase()) || typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+
+  return undefined;
+}
+
+function extractStructuredRecordGeometries(
+  record: Record<string, unknown>,
+  fields: ScalarField[],
+  description?: string,
+  context?: GeoContext,
+): GeoEntity[] {
+  const geometries: GeoEntity[] = [];
+  const label = chooseStructuredRecordLabel(record, fields) ?? description;
+  const numericValue = (candidateKeys: string[]): number | undefined => {
+    for (const [key, rawValue] of Object.entries(record)) {
+      if (!candidateKeys.includes(key.toLowerCase())) continue;
+      const value = Number(rawValue);
+      if (!Number.isNaN(value)) return value;
+    }
+    return undefined;
+  };
+
+  const lat = numericValue(["lat", "latitude", "y"]);
+  const lon = numericValue(["lon", "lng", "long", "longitude", "x"]);
+  if (lat != null && lon != null && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+    geometries.push({
+      kind: "point",
+      origin: "source",
+      label: label ?? `${lat.toFixed(4)}, ${lon.toFixed(4)}`,
+      lat,
+      lon,
+      ...(description ? { description } : {}),
+      ...(context ? { context } : {}),
+    } satisfies GeoPoint);
+  }
+
+  const directBbox = Array.isArray(record.bbox) ? record.bbox : undefined;
+  const extentBbox = Array.isArray((record.extent as any)?.spatial?.bbox)
+    ? (record.extent as any).spatial.bbox
+    : undefined;
+  const bboxSource = extentBbox ?? directBbox;
+  const bbox = Array.isArray(bboxSource?.[0]) ? bboxSource[0] : bboxSource;
+  if (Array.isArray(bbox) && bbox.length >= 4) {
+    const west = Number(bbox[0]);
+    const south = Number(bbox[1]);
+    const east = Number(bbox[2]);
+    const north = Number(bbox[3]);
+    const lonSpan = Math.abs(east - west);
+    const latSpan = Math.abs(north - south);
+    if (
+      [west, south, east, north].every((value) => !Number.isNaN(value)) &&
+      lonSpan <= 300 &&
+      latSpan <= 160
+    ) {
+      if (label) {
+        geometries.push({
+          kind: "extent",
+          origin: "source",
+          label,
+          west,
+          south,
+          east,
+          north,
+          ...(description ? { description } : {}),
+          ...(context ? { context } : {}),
+        } satisfies GeoExtent);
+      }
+
+      geometries.push({
+        kind: "point",
+        origin: "source",
+        label: label ?? `${((south + north) / 2).toFixed(4)}, ${((west + east) / 2).toFixed(4)}`,
+        lat: (south + north) / 2,
+        lon: (west + east) / 2,
+        ...(description ? { description } : {}),
+        ...(context ? { context } : {}),
+      } satisfies GeoPoint);
+    }
+  }
+
+  return geometries;
 }
 
 function walkStructuredRecords(value: unknown, visit: (record: Record<string, unknown>) => void, depth = 0): void {
@@ -491,6 +604,11 @@ function extractStructuredRecordGeoEntities(parsed: unknown, focusLabels: string
     if (!names.length) return;
 
     const description = chooseRecordDescription(fields);
+    if (!description && !isInformativeGeoContext(context)) {
+      return;
+    }
+
+    entities.push(...extractStructuredRecordGeometries(record, fields, description, context));
 
     for (const name of names) {
       entities.push({
@@ -773,7 +891,7 @@ function collectSourceGeoEntities(
       }
     }
 
-    if (hasExplicitGeometryInOutput) {
+    if (hasExplicitGeometryInOutput || structuredEntities.length) {
       continue;
     }
 
