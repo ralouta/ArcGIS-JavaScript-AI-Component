@@ -140,7 +140,12 @@ function isMcpRunStale(runToken: number): boolean {
 function isAbortLikeError(error: unknown): boolean {
   const name = (error as any)?.name;
   const message = String((error as any)?.message ?? "");
-  return name === "AbortError" || /abort/i.test(message);
+  return (
+    name === "AbortError" ||
+    name === "Canceled" ||
+    /abort/i.test(message) ||
+    /\bcancel/i.test(message)
+  );
 }
 
 export function cancelPendingMcpGeoRender(): void {
