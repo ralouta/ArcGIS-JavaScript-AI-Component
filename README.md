@@ -4,6 +4,14 @@ React + Vite app built with ArcGIS Maps SDK, ArcGIS Assistant components, and an
 
 The setup steps below include command equivalents for macOS, Linux, and Windows to reduce shell-specific onboarding errors.
 
+## Video Walkthrough
+
+[![Watch the video walkthrough: Agentic GIS Meets MCP: Building an ArcGIS AI App](https://img.youtube.com/vi/fz4QGr099ws/hqdefault.jpg)](https://youtu.be/fz4QGr099ws)
+
+Watch: [Agentic GIS Meets MCP: Building an ArcGIS AI App](https://youtu.be/fz4QGr099ws)
+
+This video walks through local setup, authorization, running the app, ArcGIS agents, and MCP integration.
+
 ## Disclaimer
 
 Most of this app has been vibe coded with various coding agents. Review the code, configuration, and deployment choices before using it beyond demos or internal experimentation.
